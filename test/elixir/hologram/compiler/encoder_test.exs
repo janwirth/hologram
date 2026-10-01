@@ -2280,6 +2280,39 @@ defmodule Hologram.Compiler.EncoderTest do
       assert encode_ir(ir) == expected
     end
 
+    test "with blame metadata for a chain of three or more operands" do
+      # (x) when x in [1, 2, 3] do
+      #  :expr_1
+      eq = fn value ->
+        %IR.RemoteFunctionCall{
+          module: %IR.AtomType{value: :erlang},
+          function: :"=:=",
+          args: [%IR.Variable{name: :x}, %IR.IntegerType{value: value}]
+        }
+      end
+
+      orelse = fn left, right ->
+        %IR.RemoteFunctionCall{
+          module: %IR.AtomType{value: :erlang},
+          function: :orelse,
+          args: [left, right]
+        }
+      end
+
+      ir = %IR.FunctionClause{
+        params: [%IR.Variable{name: :x}],
+        guards: [orelse.(orelse.(eq.(1), eq.(2)), eq.(3))],
+        body: %IR.Block{expressions: [%IR.AtomType{value: :expr_1}]},
+        blame: %{
+          params: ["x"],
+          guards: [{:or, {:or, {:leaf, "x === 1"}, {:leaf, "x === 2"}}, {:leaf, "x === 3"}}]
+        }
+      }
+
+      assert encode_ir(ir) =~
+               ~s'blame: {params: ["x"], guards: [{operator: "or", operands: [{source: "x === 1", test: (context) => Erlang["=:=/2"](context.vars.x, Type.integer(1n))}, {source: "x === 2", test: (context) => Erlang["=:=/2"](context.vars.x, Type.integer(2n))}, {source: "x === 3", test: (context) => Erlang["=:=/2"](context.vars.x, Type.integer(3n))}]}]}'
+    end
+
     test "with blame metadata for a guard split at its and/or operators" do
       # (x) when :erlang.is_integer(x) andalso :erlang.>(x, 1) do
       #  :expr_1
@@ -3019,6 +3052,63 @@ defmodule Hologram.Compiler.EncoderTest do
 
       assert encode_ir(ir) ==
                "Interpreter.callNamedFunction(context.vars.module, context.vars.fun, context.vars.args, context)"
+    end
+
+    test ":erlang.orelse/2 chain of three or more operands is flattened" do
+      # :erlang.orelse(:erlang.orelse(1, 2), 3) - what `a or b or c` and `x in [a, b, c]` nest to
+      ir = %IR.RemoteFunctionCall{
+        module: %IR.AtomType{value: :erlang},
+        function: :orelse,
+        args: [
+          %IR.RemoteFunctionCall{
+            module: %IR.AtomType{value: :erlang},
+            function: :orelse,
+            args: [%IR.IntegerType{value: 1}, %IR.IntegerType{value: 2}]
+          },
+          %IR.IntegerType{value: 3}
+        ]
+      }
+
+      assert encode_ir(ir) ==
+               ~s'Interpreter.orelseChain([(context) => Type.integer(1n), (context) => Type.integer(2n), (context) => Type.integer(3n)], context)'
+    end
+
+    test ":erlang.andalso/2 chain of three or more operands is flattened" do
+      # :erlang.andalso(:erlang.andalso(1, 2), 3)
+      ir = %IR.RemoteFunctionCall{
+        module: %IR.AtomType{value: :erlang},
+        function: :andalso,
+        args: [
+          %IR.RemoteFunctionCall{
+            module: %IR.AtomType{value: :erlang},
+            function: :andalso,
+            args: [%IR.IntegerType{value: 1}, %IR.IntegerType{value: 2}]
+          },
+          %IR.IntegerType{value: 3}
+        ]
+      }
+
+      assert encode_ir(ir) ==
+               ~s'Interpreter.andalsoChain([(context) => Type.integer(1n), (context) => Type.integer(2n), (context) => Type.integer(3n)], context)'
+    end
+
+    test ":erlang.orelse/2 right-nested chain stays nested" do
+      # :erlang.orelse(1, :erlang.orelse(2, 3))
+      ir = %IR.RemoteFunctionCall{
+        module: %IR.AtomType{value: :erlang},
+        function: :orelse,
+        args: [
+          %IR.IntegerType{value: 1},
+          %IR.RemoteFunctionCall{
+            module: %IR.AtomType{value: :erlang},
+            function: :orelse,
+            args: [%IR.IntegerType{value: 2}, %IR.IntegerType{value: 3}]
+          }
+        ]
+      }
+
+      assert encode_ir(ir) ==
+               ~s'Erlang["orelse/2"]((context) => Type.integer(1n), (context) => Erlang["orelse/2"]((context) => Type.integer(2n), (context) => Type.integer(3n), context), context)'
     end
 
     test ":erlang.orelse/2 call" do

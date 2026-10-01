@@ -117,6 +117,49 @@ export default class Interpreter {
   // stacktrace (e.g. ArithmeticError appending the failed operation). Only
   // the struct is taken from the returned pair - the client keeps reporting
   // the raw trace, the way rescue clauses see it.
+  // `a and b and c` flattened by the compiler: the same evaluation as the
+  // nested Erlang["andalso/2"] calls - every operand but the last must be a
+  // boolean, the first false one is the result, otherwise the last operand
+  // is returned as is.
+  static andalsoChain(closures, context) {
+    let result = closures[0](context);
+
+    for (let i = 1; i < closures.length; ++i) {
+      if (!Type.isBoolean(result)) {
+        Interpreter.raiseFramelessError(["badarg", result]);
+      }
+
+      if (!Type.isTrue(result)) {
+        return result;
+      }
+
+      result = closures[i](context);
+    }
+
+    return result;
+  }
+
+  // `a or b or c` flattened by the compiler: the first true operand is the
+  // result, every operand but the last must be a boolean, otherwise the
+  // last operand is returned as is.
+  static orelseChain(closures, context) {
+    let result = closures[0](context);
+
+    for (let i = 1; i < closures.length; ++i) {
+      if (!Type.isBoolean(result)) {
+        Interpreter.raiseFramelessError(["badarg", result]);
+      }
+
+      if (Type.isTrue(result)) {
+        return result;
+      }
+
+      result = closures[i](context);
+    }
+
+    return result;
+  }
+
   // Deps: [Exception.blame/3]
   static blameError(reason, stacktrace = Type.list()) {
     const result = Elixir_Exception["blame/3"](
@@ -1751,6 +1794,17 @@ export default class Interpreter {
         Interpreter.#evaluatesToTrue(guard.test, context),
         guard.source,
       );
+    }
+
+    // A chain of one operator arrives flat (see the compiler's
+    // encode_clause_blame_guard/3) and is folded back into the left-nested
+    // tuples the renderer expects: `a or b or c` is {:or, {:or, a, b}, c}.
+    if (guard.operands !== undefined) {
+      return guard.operands
+        .map((operand) => Interpreter.#blameGuard(operand, context))
+        .reduce((left, right) =>
+          Type.tuple([Type.atom(guard.operator), left, right]),
+        );
     }
 
     return Type.tuple([

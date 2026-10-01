@@ -869,6 +869,110 @@ describe("Interpreter", () => {
     });
   });
 
+  describe("andalsoChain()", () => {
+    const context = contextFixture();
+
+    it("returns the last operand when every earlier one is true", () => {
+      const result = Interpreter.andalsoChain(
+        [
+          (_ctx) => Type.boolean(true),
+          (_ctx) => Type.boolean(true),
+          (_ctx) => Type.integer(3),
+        ],
+        context,
+      );
+
+      assert.deepStrictEqual(result, Type.integer(3));
+    });
+
+    it("stops at the first false operand without evaluating the rest", () => {
+      let evaluated = false;
+
+      const result = Interpreter.andalsoChain(
+        [
+          (_ctx) => Type.boolean(true),
+          (_ctx) => Type.boolean(false),
+          (_ctx) => {
+            evaluated = true;
+            return Type.boolean(true);
+          },
+        ],
+        context,
+      );
+
+      assert.deepStrictEqual(result, Type.boolean(false));
+      assert.isFalse(evaluated);
+    });
+
+    it("raises badarg when a non-last operand is not a boolean", () => {
+      assertBoxedError(
+        () =>
+          Interpreter.andalsoChain(
+            [
+              (_ctx) => Type.boolean(true),
+              (_ctx) => Type.integer(2),
+              (_ctx) => Type.boolean(true),
+            ],
+            context,
+          ),
+        "ArgumentError",
+        "argument error: 2",
+      );
+    });
+  });
+
+  describe("orelseChain()", () => {
+    const context = contextFixture();
+
+    it("returns the first true operand without evaluating the rest", () => {
+      let evaluated = false;
+
+      const result = Interpreter.orelseChain(
+        [
+          (_ctx) => Type.boolean(false),
+          (_ctx) => Type.boolean(true),
+          (_ctx) => {
+            evaluated = true;
+            return Type.boolean(false);
+          },
+        ],
+        context,
+      );
+
+      assert.deepStrictEqual(result, Type.boolean(true));
+      assert.isFalse(evaluated);
+    });
+
+    it("returns the last operand when every earlier one is false", () => {
+      const result = Interpreter.orelseChain(
+        [
+          (_ctx) => Type.boolean(false),
+          (_ctx) => Type.boolean(false),
+          (_ctx) => Type.integer(3),
+        ],
+        context,
+      );
+
+      assert.deepStrictEqual(result, Type.integer(3));
+    });
+
+    it("raises badarg when a non-last operand is not a boolean", () => {
+      assertBoxedError(
+        () =>
+          Interpreter.orelseChain(
+            [
+              (_ctx) => Type.boolean(false),
+              (_ctx) => Type.integer(2),
+              (_ctx) => Type.boolean(true),
+            ],
+            context,
+          ),
+        "ArgumentError",
+        "argument error: 2",
+      );
+    });
+  });
+
   describe("blameError()", () => {
     it("normalizes a bare reason", () => {
       const result = Interpreter.blameError(Type.atom("badarg"));
@@ -10536,6 +10640,71 @@ describe("Interpreter", () => {
           [clauseHead],
         );
       };
+
+      // def my_fun(x, y) when x in [1, 2, 3] - a chain the compiler
+      // flattens into one blame node with an operands list
+      it("folds a flattened operand chain back into left-nested tuples", () => {
+        const eq = (value) => ({
+          source: `x === ${value}`,
+          test: (context) =>
+            Erlang["=:=/2"](context.vars.x, Type.integer(value)),
+        });
+
+        Interpreter.defineFunctionClauseHeads(
+          "MyChainBlamedModule",
+          "my_fun",
+          2,
+          "public",
+          [
+            {
+              params: (_context) => [
+                Type.variablePattern("x"),
+                Type.variablePattern("y"),
+              ],
+              guards: [],
+              blame: {
+                params: ["x", "y"],
+                guards: [{operator: "or", operands: [eq(1), eq(2), eq(3)]}],
+              },
+            },
+          ],
+        );
+
+        let caught;
+
+        try {
+          Interpreter.raiseFunctionClauseError(
+            "MyChainBlamedModule",
+            "my_fun",
+            2,
+            [Type.integer(2), Type.integer(9)],
+          );
+        } catch (e) {
+          caught = e;
+        }
+
+        const clauses = caught.value.data["atom(clauses)"][1];
+
+        assert.deepStrictEqual(
+          clauses,
+          Type.list([
+            Type.tuple([
+              Type.list([blamedNode(true, "x"), blamedNode(true, "y")]),
+              Type.list([
+                Type.tuple([
+                  Type.atom("or"),
+                  Type.tuple([
+                    Type.atom("or"),
+                    blamedNode(false, "x === 1"),
+                    blamedNode(true, "x === 2"),
+                  ]),
+                  blamedNode(false, "x === 3"),
+                ]),
+              ]),
+            ]),
+          ]),
+        );
+      });
 
       it("marks the parts of the clause head that didn't match", () => {
         defineClauseHeads();

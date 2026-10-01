@@ -922,16 +922,35 @@ defmodule Hologram.Compiler.Encoder do
     )
   end
 
+  # A left-nested chain of one operator (`a or b or c`, `x in [...]`) is
+  # encoded as one node with its operands in order rather than as nested
+  # objects, for the same reason the guard itself is (see
+  # encode_short_circuit_chain/4). The client folds the operands back into
+  # the left-nested tuples the blame renderer expects.
   defp encode_clause_blame_guard(
-         {operator, left, right},
-         %IR.RemoteFunctionCall{module: %IR.AtomType{value: :erlang}, args: [left_ir, right_ir]},
+         {operator, _left, _right} = guard,
+         %IR.RemoteFunctionCall{module: %IR.AtomType{value: :erlang}, args: [_, _]} = guard_ir,
          context
        ) do
-    encode_as_object(
-      operator: encode_as_string(operator, true),
-      left: encode_clause_blame_guard(left, left_ir, context),
-      right: encode_clause_blame_guard(right, right_ir, context)
-    )
+    case flatten_blame_chain(operator, guard, guard_ir) do
+      [{left, left_ir}, {right, right_ir}] ->
+        encode_as_object(
+          operator: encode_as_string(operator, true),
+          left: encode_clause_blame_guard(left, left_ir, context),
+          right: encode_clause_blame_guard(right, right_ir, context)
+        )
+
+      operands ->
+        operands_js =
+          Enum.map_join(operands, ", ", fn {operand, operand_ir} ->
+            encode_clause_blame_guard(operand, operand_ir, context)
+          end)
+
+        encode_as_object(
+          operator: encode_as_string(operator, true),
+          operands: "[#{operands_js}]"
+        )
+    end
   end
 
   defp encode_clause_blame_guard({:leaf, source}, guard_ir, context) do
@@ -939,6 +958,30 @@ defmodule Hologram.Compiler.Encoder do
       source: encode_as_string(source, true),
       test: encode_closure(guard_ir, context)
     )
+  end
+
+  # Blame operands paired with their IR, walking both in step; the blame tree
+  # and the guard IR share their shape (see Hologram.Compiler.ClauseBlame).
+  defp flatten_blame_chain(
+         operator,
+         {operator, {operator, _, _} = left, right},
+         %IR.RemoteFunctionCall{
+           module: %IR.AtomType{value: :erlang},
+           function: function,
+           args: [left_ir, right_ir]
+         }
+       )
+       when (operator == :and and function == :andalso) or
+              (operator == :or and function == :orelse) do
+    flatten_blame_chain(operator, left, left_ir) ++ [{right, right_ir}]
+  end
+
+  defp flatten_blame_chain(
+         _operator,
+         {_, left, right},
+         %IR.RemoteFunctionCall{args: [left_ir, right_ir]}
+       ) do
+    [{left, left_ir}, {right, right_ir}]
   end
 
   defp encode_clause_head(%IR.FunctionClause{} = clause, context) do
@@ -977,6 +1020,35 @@ defmodule Hologram.Compiler.Encoder do
 
     [match: match, guards: guards, body: body]
   end
+
+  defp encode_short_circuit_chain(operator, left, right, context) do
+    case flatten_short_circuit_chain(operator, left, right) do
+      [left_ir, right_ir] ->
+        left_js = encode_closure(left_ir, context)
+        right_js = encode_closure(right_ir, context)
+
+        "Erlang[\"#{operator}/2\"](#{left_js}, #{right_js}, context)"
+
+      operands ->
+        closures = Enum.map_join(operands, ", ", &encode_closure(&1, context))
+        "Interpreter.#{operator}Chain([#{closures}], context)"
+    end
+  end
+
+  # Operands of a left-nested chain of the given operator, in evaluation order.
+  defp flatten_short_circuit_chain(
+         operator,
+         %IR.RemoteFunctionCall{
+           module: %IR.AtomType{value: :erlang},
+           function: operator,
+           args: [left, right]
+         },
+         last
+       ) do
+    flatten_short_circuit_chain(operator, left, right) ++ [last]
+  end
+
+  defp flatten_short_circuit_chain(_operator, left, right), do: [left, right]
 
   defp encode_closure(ir, context)
 
@@ -1064,11 +1136,17 @@ defmodule Hologram.Compiler.Encoder do
     "{#{fields}}"
   end
 
+  # `a and b and c` (and `x in [a, b, c]`, which expands to a chain of
+  # `===` joined by `or`) nests to the left: `andalso(andalso(a, b), c)`.
+  # Encoded literally, a chain of n operands becomes n nested closures, and
+  # a guard such as `when tz in [...600 names...]` yields JavaScript that
+  # SpiderMonkey refuses to parse ("function nested too deeply") and V8
+  # overflows on with a small stack. A chain of three or more operands is
+  # flattened into one call with the operand closures in evaluation order;
+  # Interpreter.andalsoChain/orelseChain apply the same boolean checks and
+  # short-circuiting the nested calls would.
   defp encode_named_function_call(%IR.AtomType{value: :erlang}, :andalso, [left, right], context) do
-    left_js = encode_closure(left, context)
-    right_js = encode_closure(right, context)
-
-    "Erlang[\"andalso/2\"](#{left_js}, #{right_js}, context)"
+    encode_short_circuit_chain(:andalso, left, right, context)
   end
 
   # Encoded as Interpreter.callNamedFunction() instead of Erlang["apply/3"]()
@@ -1083,10 +1161,7 @@ defmodule Hologram.Compiler.Encoder do
   end
 
   defp encode_named_function_call(%IR.AtomType{value: :erlang}, :orelse, [left, right], context) do
-    left_js = encode_closure(left, context)
-    right_js = encode_closure(right, context)
-
-    "Erlang[\"orelse/2\"](#{left_js}, #{right_js}, context)"
+    encode_short_circuit_chain(:orelse, left, right, context)
   end
 
   defp encode_named_function_call(%IR.AtomType{} = module, function, args, context) do
