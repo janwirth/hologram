@@ -54,6 +54,7 @@ defmodule Mix.Tasks.Compile.Hologram do
 
   require Logger
 
+  alias Hologram.Assets.PageDigestRegistry
   alias Hologram.Commons.PLT
   alias Hologram.Commons.SystemUtils
   alias Hologram.Compiler
@@ -782,6 +783,12 @@ defmodule Mix.Tasks.Compile.Hologram do
 
     PLT.dump(page_digest_plt, page_digest_plt_dump_path)
     PLT.stop(page_digest_plt)
+
+    # A compile started by the Phoenix code reloader doesn't go through LiveReload, so nothing else
+    # tells the running registry about the new digests and pages keep rendering the deleted bundles.
+    if :ets.whereis(PageDigestRegistry.ets_table_name()) != :undefined do
+      PageDigestRegistry.reload()
+    end
   end
 
   # The pages graph of a compile that kept the runtime's MFAs, made once a page is left to rebuild.
