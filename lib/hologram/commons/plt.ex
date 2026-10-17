@@ -165,6 +165,23 @@ defmodule Hologram.Commons.PLT do
   end
 
   @doc """
+  Loads the PLT dump at the given path in place of the PLT's contents. Unlike
+  `reset/1` followed by `load/2`, the table is never empty in between, so a
+  concurrent reader always finds a key that exists before and after.
+  """
+  @spec replace_load(t, String.t()) :: t
+  def replace_load(%{table_ref: table_ref} = plt, dump_path) do
+    items =
+      dump_path
+      |> File.read!()
+      |> SerializationUtils.deserialize(true)
+      |> Map.to_list()
+
+    ETS.replace_all(table_ref, items)
+    plt
+  end
+
+  @doc """
   Puts multiple items into the PLT.
   """
   @spec put(PLT.t(), list({any, any})) :: PLT.t()

@@ -133,6 +133,26 @@ defmodule Hologram.Commons.ETS do
   end
 
   @doc """
+  Replaces the ETS table's contents with the given items without emptying it
+  first: the new items are inserted, then the keys they don't have are deleted.
+  A concurrent reader sees the old value or the new one for every key that
+  exists in both, never a missing key, unlike `reset/1` followed by `put/2`.
+  """
+  @spec replace_all(tid, [{any, any}]) :: true
+  def replace_all(table_name_or_ref, items) do
+    :ets.insert(table_name_or_ref, items)
+    new_keys = MapSet.new(items, &elem(&1, 0))
+
+    table_name_or_ref
+    |> :ets.tab2list()
+    |> Enum.each(fn {key, _value} ->
+      unless MapSet.member?(new_keys, key), do: :ets.delete(table_name_or_ref, key)
+    end)
+
+    true
+  end
+
+  @doc """
   Removes all items from the ETS table.
   """
   @spec reset(tid) :: true

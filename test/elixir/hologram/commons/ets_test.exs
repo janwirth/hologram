@@ -187,6 +187,24 @@ defmodule Hologram.Commons.ETSTest do
     assert get_all(table_ref) == %{}
   end
 
+  describe "replace_all/2" do
+    test "updates, adds and removes keys", %{table_ref: table_ref} do
+      assert replace_all(table_ref, [{:my_key_2, :new_value_2}, {:my_key_3, :my_value_3}])
+      assert get_all(table_ref) == %{my_key_2: :new_value_2, my_key_3: :my_value_3}
+    end
+
+    test "a reader never finds a key that is in both the old and the new contents missing", %{table_ref: table_ref} do
+      reader =
+        Task.async(fn ->
+          Enum.all?(1..20_000, fn _i -> match?([_entry], :ets.lookup(table_ref, :my_key_1)) end)
+        end)
+
+      for i <- 1..200, do: replace_all(table_ref, [{:my_key_1, i} | Enum.map(1..50, &{&1, &1})])
+
+      assert Task.await(reader)
+    end
+  end
+
   describe "table_exists?/1" do
     test "exists, named" do
       table_name = random_atom()

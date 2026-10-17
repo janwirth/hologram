@@ -106,10 +106,11 @@ defmodule Hologram.Assets.ChunkRegistry do
   """
   @spec reload :: PLT.t()
   def reload do
+    # Swapped in place, not reset and refilled: a request during a live
+    # reload must never find the registry empty.
     impl().ets_table_name()
     |> plt()
-    |> PLT.reset()
-    |> populate()
+    |> PLT.replace_load(impl().dump_path())
   end
 
   defp collect_named_modules(term, acc) when is_atom(term) do

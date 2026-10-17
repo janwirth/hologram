@@ -96,10 +96,10 @@ defmodule Hologram.Assets.PathRegistry do
   """
   @spec reload :: :ok
   def reload do
-    ets_table_name = impl().ets_table_name()
-    ETS.reset(ets_table_name)
-
-    populate(ets_table_name)
+    # Swapped in place, not reset and refilled: a page rendered during a live
+    # reload would otherwise find no "hologram/runtime.js" (AssetNotFoundError).
+    ETS.replace_all(impl().ets_table_name(), find_assets(impl().static_dir()))
+    :ok
   end
 
   @doc """
