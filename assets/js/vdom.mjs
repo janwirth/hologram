@@ -210,10 +210,21 @@ export default class Vdom {
 
     // DOM nodes past the rendered children - third-party insertions or divergence - are mirrored
     // as themselves, so the patch removes them.
+    //
+    // Except at the end of <head> and <body>, where tools append what the render never knows: a
+    // dev toolbar's <meta> and <script>, a live reload <iframe>, a polyfill's <style>. Those are
+    // kept out of the vdom: what the patch never sees it neither removes nor moves, and what it
+    // appends lands after them. The runtime's own scripts sit there too, omitted by the boot
+    // render; they are mirrored as themselves, so the patch removes them once they have run.
+    const keepsAppended = $.#isHeadOrBody(domNode);
+
     while (cursor.index < domNode.childNodes.length) {
-      mirroredChildren.push(
-        $.#vnodeOfDomNode(domNode.childNodes[cursor.index]),
-      );
+      const childNode = domNode.childNodes[cursor.index];
+
+      if (!keepsAppended || $.#isRuntimeScript(childNode)) {
+        mirroredChildren.push($.#vnodeOfDomNode(childNode));
+      }
+
       cursor.index += 1;
     }
 
@@ -223,6 +234,23 @@ export default class Vdom {
       mirroredChildren,
       undefined,
       domNode,
+    );
+  }
+
+  static #isHeadOrBody(domNode) {
+    return (
+      domNode.nodeType === Node.ELEMENT_NODE &&
+      ["head", "body"].includes(domNode.tagName.toLowerCase())
+    );
+  }
+
+  // A script the runtime served itself: the runtime bundle or a page bundle. The boot render
+  // omits them, and once run they are dead weight, so the patch may remove them.
+  static #isRuntimeScript(domNode) {
+    return (
+      domNode.nodeType === Node.ELEMENT_NODE &&
+      domNode.tagName.toLowerCase() === "script" &&
+      (domNode.getAttribute("src") ?? "").startsWith("/hologram/")
     );
   }
 
