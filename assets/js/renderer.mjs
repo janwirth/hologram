@@ -2262,6 +2262,14 @@ export default class Renderer {
       return;
     }
 
+    // The element the user is typing in keeps what they typed. A render that lands while the
+    // field has focus carries the state as it was when some earlier keystroke was handled; writing
+    // it back would erase the keystrokes since. The state catches up on the next render after the
+    // field loses focus, or when the last round trip answers.
+    if (element === element.ownerDocument?.activeElement) {
+      return;
+    }
+
     element.value = newValue;
   }
 
