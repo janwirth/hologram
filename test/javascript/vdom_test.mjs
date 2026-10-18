@@ -304,6 +304,77 @@ describe("Vdom", () => {
       assert.equal(container.childNodes.length, 1);
     });
 
+    // Tools append to <head> and <body> after the server rendered them: a dev toolbar's <meta>
+    // and <script>, a live reload <iframe>, a polyfill's <style>. The render never knows them,
+    // so they are not the patch's to remove, and nodes the patch appends go after them.
+    const adoptSection = (tagName, renderedChildren, html) => {
+      const section = document.createElement(tagName);
+      section.innerHTML = html;
+      const rendered = vnode(tagName, {attrs: {}}, renderedChildren);
+      const mirrored = Vdom.mirror(rendered, section);
+
+      return {section, patched: () => patch(mirrored, rendered)};
+    };
+
+    it("leaves nodes appended to the head alone and appends after them", () => {
+      const {section, patched} = adoptSection(
+        "head",
+        [
+          vnode("meta", {attrs: {charset: "utf-8"}}, []),
+          vnode(
+            "link",
+            {
+              key: "__hologramLink__:/app.css",
+              attrs: {rel: "stylesheet", href: "/app.css"},
+            },
+            [],
+          ),
+        ],
+        '<meta charset="utf-8">' +
+          '<meta name="tool:config" content="{}">' +
+          '<script src="https://tool.example/toolbar.js"></script>',
+      );
+
+      const toolMeta = section.querySelector("meta[name]");
+      const toolScript = section.querySelector("script");
+
+      patched();
+
+      assert.equal(section.querySelector("meta[name]"), toolMeta);
+      assert.equal(section.querySelector("script"), toolScript);
+      assert.equal(section.lastChild.tagName, "LINK");
+    });
+
+    it("leaves nodes appended to the body alone", () => {
+      const {section, patched} = adoptSection(
+        "body",
+        [vnode("div", {attrs: {id: "app"}}, [])],
+        '<div id="app"></div><iframe src="/phoenix/live_reload/frame"></iframe>',
+      );
+
+      const iframe = section.querySelector("iframe");
+
+      patched();
+
+      assert.equal(section.querySelector("iframe"), iframe);
+    });
+
+    it("still removes the runtime's own scripts appended to the head", () => {
+      const {section, patched} = adoptSection(
+        "head",
+        [vnode("meta", {attrs: {charset: "utf-8"}}, [])],
+        '<meta charset="utf-8">' +
+          '<script src="/hologram/runtime-abc.js"></script>' +
+          '<script src="/hologram/page-MyPage-def.js"></script>' +
+          '<meta name="tool:config" content="{}">',
+      );
+
+      patched();
+
+      assert.equal(section.querySelectorAll("script").length, 0);
+      assert.isNotNull(section.querySelector("meta[name]"));
+    });
+
     it("creates rendered nodes with no DOM counterpart", () => {
       const {container, patched} = adopt(
         [vnode("p", {attrs: {}}, []), vnode("em", {attrs: {}}, [])],
