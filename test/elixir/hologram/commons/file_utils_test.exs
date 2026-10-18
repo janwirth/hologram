@@ -54,6 +54,26 @@ defmodule Hologram.Commons.FileUtilsTest do
         list_files_recursively("my/invalid/path")
       end
     end
+
+    # A file another tool removes between the listing and the check looks the same.
+    test "skips an entry that is neither a file nor a dir" do
+      dir_path =
+        Path.join([
+          Reflection.tmp_dir(),
+          "tests",
+          "commons",
+          "file_utils",
+          "list_files_recursively_1"
+        ])
+
+      clean_dir(dir_path)
+
+      file_path = Path.join(dir_path, "file_1.txt")
+      File.write!(file_path, "file_1")
+      File.ln_s!(Path.join(dir_path, "gone.txt"), Path.join(dir_path, "dangling.txt"))
+
+      assert list_files_recursively(dir_path) == [file_path]
+    end
   end
 
   test "recreate_dir/1" do

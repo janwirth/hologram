@@ -27,6 +27,9 @@ defmodule Hologram.LiveReload do
   # served with the bundle it had, and the reload event heals the tab once the page is built.
   @await_page_timeout 60_000
 
+  # How long `await_idle/1` waits by default, in milliseconds.
+  @await_idle_timeout 120_000
+
   # How long a tab may be seen without an SSE connection before it counts as closed, in
   # milliseconds. A tab is without one between its page's render and the stream's attach, which
   # SubscriptionRegistry.attach_wait_ms/0 bounds, and while it reconnects, each attempt up to the
@@ -86,6 +89,14 @@ defmodule Hologram.LiveReload do
       end
     else
       {:reply, :ok, state}
+    end
+  end
+
+  def handle_call(:await_idle, from, state) do
+    if state.pass == nil and state.timer_ref == nil do
+      {:reply, idle_result(state), state}
+    else
+      {:noreply, %{state | idle_waiters: [from | state.idle_waiters]}}
     end
   end
 
@@ -170,6 +181,7 @@ defmodule Hologram.LiveReload do
     {:noreply, %{state | open_pages: open_pages}}
   end
 
+  @impl GenServer
   def handle_cast({:replay_outcome, pid}, state) do
     if state.outcome, do: send(pid, state.outcome)
     {:noreply, state}
@@ -232,8 +244,31 @@ defmodule Hologram.LiveReload do
   # compile refusing the code is not a crash (see reload/3).
   @impl GenServer
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{pass: %{ref: ref}} = state) do
-    Logger.error("Hologram: live reload pass failed: " <> Exception.format_exit(reason))
-    {:noreply, finish_pass(state)}
+    crash = Exception.format_exit(reason)
+    Logger.error("Hologram: live reload pass failed: " <> crash)
+    {:noreply, finish_pass(%{state | crash: crash})}
+  end
+
+  @doc """
+  Waits until no live reload pass is running or about to run (a save is debounced for
+  `debounce_delay/0`), then returns how the last pass went: `:ok`, or `{:error, text}` with the
+  compiler's diagnostic as plain text when a compile refused the code, or the reason when the pass
+  crashed. An editor or an agent calls it after a save to learn when the app runs the edit, and
+  with what error. Returns `:ok` at once when live reload is not running, and after the timeout.
+  """
+  @spec await_idle(timeout) :: :ok | {:error, String.t()}
+  def await_idle(timeout \\ @await_idle_timeout) do
+    case GenServer.whereis(__MODULE__) do
+      nil ->
+        :ok
+
+      pid ->
+        try do
+          GenServer.call(pid, :await_idle, timeout)
+        catch
+          :exit, _reason -> :ok
+        end
+    end
   end
 
   @doc """
@@ -272,7 +307,11 @@ defmodule Hologram.LiveReload do
   @spec initial_state(any) :: map
   def initial_state(endpoint) do
     %{
+      # Why the last pass crashed, formatted, nil when it did not and while a pass runs.
+      crash: nil,
       endpoint: endpoint,
+      # The `await_idle/1` callers waiting for the running or the debounced pass to end.
+      idle_waiters: [],
       # What each tab showed at its last render, by instance id, with when it was first seen without
       # an SSE connection (nil while it holds one).
       open_pages: %{},
@@ -464,10 +503,26 @@ defmodule Hologram.LiveReload do
     new_state = %{state | pass: nil, priority: [], waiters: %{}}
 
     case new_state.superseded_by do
-      nil -> new_state
-      file_path -> start_pass(file_path, %{new_state | superseded_by: nil})
+      nil ->
+        # The callers waiting for idle are answered once no pass follows.
+        result = idle_result(new_state)
+        Enum.each(new_state.idle_waiters, &GenServer.reply(&1, result))
+        %{new_state | idle_waiters: []}
+
+      file_path ->
+        start_pass(file_path, %{new_state | superseded_by: nil})
     end
   end
+
+  # What `await_idle/1` answers: the crash of the last pass, else its compile error as text, else
+  # :ok (compiled, or no pass yet).
+  defp idle_result(%{crash: crash}) when is_binary(crash), do: {:error, crash}
+
+  defp idle_result(%{outcome: {:compilation_error, lines}}) do
+    {:error, Enum.map_join(lines, "\n", fn line -> Enum.map_join(line, "", & &1.text) end)}
+  end
+
+  defp idle_result(_state), do: :ok
 
   defp impl do
     Application.get_env(:hologram, :live_reload_impl, __MODULE__)
@@ -594,7 +649,7 @@ defmodule Hologram.LiveReload do
     # The outcome is forgotten while the pass runs: the code it was about has changed, and a tab
     # reloaded or opened meanwhile must not be shown an error a newer save may have fixed. A stream
     # attached by the time the pass ends gets its outcome broadcast.
-    %{state | outcome: nil, pass: %{ref: task.ref, registries_reloaded?: false}}
+    %{state | crash: nil, outcome: nil, pass: %{ref: task.ref, registries_reloaded?: false}}
   end
 
   # The message a pass's outcome is broadcast as. The tabs' SSE streams forward it: a tab takes its
