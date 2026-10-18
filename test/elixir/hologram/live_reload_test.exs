@@ -713,10 +713,109 @@ defmodule Hologram.LiveReloadTest do
 
       refute_received :compiled
       refute_received {:compilation_error, _lines}
+      assert {:error, reason} = LiveReload.await_idle()
+      assert reason =~ "expected test error"
 
       send(pid, {:debounced_reload, "second.ex"})
 
       assert_receive :second_started
+      assert LiveReload.await_idle() == :ok
+    end
+
+    test "await_idle/1 returns :ok at once when no pass runs", %{pid: _pid} do
+      assert LiveReload.await_idle() == :ok
+    end
+
+    test "await_idle/1 waits for the running pass and returns its result", %{pid: pid} do
+      test_pid = self()
+
+      expect(LiveReloadMock, :reload, fn _file_path, _endpoint, _opts ->
+        send(test_pid, {:started, self()})
+
+        receive do
+          :continue -> :ok
+        end
+      end)
+
+      send(pid, {:debounced_reload, @file_path})
+      assert_receive {:started, task_pid}
+
+      request = Task.async(fn -> LiveReload.await_idle() end)
+
+      wait_until(fn -> :sys.get_state(pid).idle_waiters != [] end)
+      assert Task.yield(request, 50) == nil
+
+      send(task_pid, :continue)
+
+      assert Task.await(request) == :ok
+    end
+
+    test "await_idle/1 waits for a debounced save, and for the pass it starts", %{pid: pid} do
+      test_pid = self()
+
+      expect(LiveReloadMock, :reload, fn _file_path, _endpoint, _opts ->
+        send(test_pid, :started)
+        :ok
+      end)
+
+      send(pid, {:file_event, self(), {@file_path, [:modified]}})
+
+      request = Task.async(fn -> LiveReload.await_idle() end)
+
+      wait_until(fn -> :sys.get_state(pid).idle_waiters != [] end)
+      refute_received :started
+
+      assert Task.await(request, @debounce_delay + 1_000) == :ok
+      assert_received :started
+    end
+
+    test "await_idle/1 returns the diagnostic as text when a compile refused the code", %{
+      pid: pid
+    } do
+      lines = [
+        [%{tone: :banner, text: "** (Hologram.CompileError) boom"}],
+        [%{tone: :chrome, text: "  └─ "}, %{tone: :meta, text: "lib/my_page.ex:3"}]
+      ]
+
+      expect(LiveReloadMock, :reload, fn _file_path, _endpoint, _opts -> {:error, lines} end)
+
+      send(pid, {:debounced_reload, @file_path})
+      wait_until(fn -> :sys.get_state(pid).pass == nil end)
+
+      assert LiveReload.await_idle() ==
+               {:error, "** (Hologram.CompileError) boom\n  └─ lib/my_page.ex:3"}
+    end
+
+    test "await_idle/1 answers after the pass a save during a pass starts", %{pid: pid} do
+      test_pid = self()
+
+      expect(LiveReloadMock, :reload, 2, fn
+        "first.ex", _endpoint, _opts ->
+          send(test_pid, {:first_started, self()})
+
+          receive do
+            :continue -> :ok
+          end
+
+        "second.ex", _endpoint, _opts ->
+          send(test_pid, :second_started)
+          :ok
+      end)
+
+      send(pid, {:debounced_reload, "first.ex"})
+      assert_receive {:first_started, task_pid}
+
+      send(pid, {:debounced_reload, "second.ex"})
+      :sys.get_state(pid)
+
+      request = Task.async(fn -> LiveReload.await_idle() end)
+      wait_until(fn -> :sys.get_state(pid).idle_waiters != [] end)
+
+      send(task_pid, :continue)
+      assert_receive :second_started
+
+      assert Task.await(request) == :ok
+      assert :sys.get_state(pid).idle_waiters == []
     end
 
     test "a request for a page that is not pending gets its bundle at once", %{pid: _pid} do
