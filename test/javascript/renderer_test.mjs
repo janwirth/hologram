@@ -3357,6 +3357,54 @@ describe("Renderer", () => {
             assert.strictEqual(mockInput.value, "new_programmatic_value");
           });
 
+          it("leaves the value of the focused input alone", () => {
+            const node = Type.tuple([
+              Type.atom("element"),
+              Type.bitstring("input"),
+              Type.list([
+                Type.tuple([
+                  Type.bitstring("value"),
+                  Type.keywordList([[Type.atom("text"), Type.bitstring("stale")]]),
+                ]),
+              ]),
+              Type.list(),
+            ]);
+
+            const result = Renderer.renderDom(
+              node,
+              context,
+              slots,
+              defaultTarget,
+              parentTagName,
+            );
+
+            const input = document.createElement("input");
+            document.body.appendChild(input);
+
+            try {
+              input.value = "typed so far";
+              input.focus();
+
+              result.data.hook.update(null, {
+                elm: input,
+                data: {hologramFormInputValue: "stale"},
+              });
+
+              assert.strictEqual(input.value, "typed so far");
+
+              input.blur();
+
+              result.data.hook.update(null, {
+                elm: input,
+                data: {hologramFormInputValue: "caught up"},
+              });
+
+              assert.strictEqual(input.value, "caught up");
+            } finally {
+              input.remove();
+            }
+          });
+
           it("updates value regardless of current input value", () => {
             const node = Type.tuple([
               Type.atom("element"),
