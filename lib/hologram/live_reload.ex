@@ -16,9 +16,13 @@ defmodule Hologram.LiveReload do
   @doc """
   Reloads the application after a change of the given file (nil when a request for a pending page
   starts the pass), using the given endpoint. The options go to the Hologram compile task:
-  `:next_batch` and `:bundles_built` (see `Mix.Tasks.Compile.Hologram`).
+  `:next_batch` and `:bundles_built` (see `Mix.Tasks.Compile.Hologram`). Returns the compiler's
+  output when the code did not compile.
   """
-  @callback reload(String.t() | nil, any, keyword) :: :ok
+  @callback reload(String.t() | nil, any, keyword) :: :ok | {:error, String.t()}
+
+  # How long `await_idle/1` waits by default, in milliseconds.
+  @await_idle_timeout 120_000
 
   # How long a request for a pending page waits for its bundle, in milliseconds. Past it the page is
   # served with the bundle it had, and the reload event heals the tab once the page is built.
@@ -83,6 +87,14 @@ defmodule Hologram.LiveReload do
       end
     else
       {:reply, :ok, state}
+    end
+  end
+
+  def handle_call(:await_idle, from, state) do
+    if state.pass == nil and state.timer_ref == nil do
+      {:reply, state.last_result, state}
+    else
+      {:noreply, %{state | idle_waiters: [from | state.idle_waiters]}}
     end
   end
 
@@ -199,15 +211,38 @@ defmodule Hologram.LiveReload do
   end
 
   @impl GenServer
-  def handle_info({ref, _result}, %{pass: %{ref: ref}} = state) do
+  def handle_info({ref, result}, %{pass: %{ref: ref}} = state) do
     Process.demonitor(ref, [:flush])
-    {:noreply, finish_pass(state)}
+    result = if match?({:error, _output}, result), do: result, else: :ok
+    {:noreply, finish_pass(state, result)}
   end
 
   @impl GenServer
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{pass: %{ref: ref}} = state) do
     Logger.error("Hologram: live reload pass failed: #{inspect(reason)}")
-    {:noreply, finish_pass(state)}
+    {:noreply, finish_pass(state, {:error, Exception.format_exit(reason)})}
+  end
+
+  @doc """
+  Waits until no live reload pass is running or about to run (a save is debounced for
+  `debounce_delay/0`), then returns how the last pass went: `:ok`, or `{:error, output}` with the
+  compiler's output when the code did not compile, or the reason when the pass failed. An editor
+  or an agent calls it after a save to learn when the app runs the edit, and with what error.
+  Returns `:ok` at once when live reload is not running, and after the timeout.
+  """
+  @spec await_idle(timeout) :: :ok | {:error, String.t()}
+  def await_idle(timeout \\ @await_idle_timeout) do
+    case GenServer.whereis(__MODULE__) do
+      nil ->
+        :ok
+
+      pid ->
+        try do
+          GenServer.call(pid, :await_idle, timeout)
+        catch
+          :exit, _reason -> :ok
+        end
+    end
   end
 
   @doc """
@@ -247,6 +282,10 @@ defmodule Hologram.LiveReload do
   def initial_state(endpoint) do
     %{
       endpoint: endpoint,
+      # The `await_idle/1` callers waiting for the running or the debounced pass to end.
+      idle_waiters: [],
+      # How the last pass went, what `await_idle/1` answers with.
+      last_result: :ok,
       # What each tab showed at its last render, by instance id, with when it was first seen without
       # an SSE connection (nil while it holds one).
       open_pages: %{},
@@ -351,6 +390,7 @@ defmodule Hologram.LiveReload do
 
       {:error, output} ->
         broadcast_compilation_error(output)
+        {:error, output}
     end
   end
 
@@ -429,15 +469,20 @@ defmodule Hologram.LiveReload do
   # A pass ended, whether it finished or failed: the pages requested during it are no longer
   # pulled forward, and a save that arrived during it starts the next pass. A request still waiting
   # is answered: its page is served with the bundle it had, and the reload event heals the tab once
-  # the page is built.
-  defp finish_pass(state) do
+  # the page is built. The callers waiting for idle are answered with the result once no pass
+  # follows.
+  defp finish_pass(state, result) do
     reply_to_waiters(state.waiters)
 
-    new_state = %{state | pass: nil, priority: [], waiters: %{}}
+    new_state = %{state | last_result: result, pass: nil, priority: [], waiters: %{}}
 
     case new_state.superseded_by do
-      nil -> new_state
-      file_path -> start_pass(file_path, %{new_state | superseded_by: nil})
+      nil ->
+        Enum.each(new_state.idle_waiters, &GenServer.reply(&1, result))
+        %{new_state | idle_waiters: []}
+
+      file_path ->
+        start_pass(file_path, %{new_state | superseded_by: nil})
     end
   end
 

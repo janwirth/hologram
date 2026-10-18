@@ -354,6 +354,14 @@ defmodule Hologram.LiveReloadTest do
     end
   end
 
+  describe "await_idle/1" do
+    test "returns at once when live reload is not running" do
+      wait_for_process_cleanup(LiveReload)
+
+      assert LiveReload.await_idle() == :ok
+    end
+  end
+
   describe "live reload pass" do
     setup :set_mox_global
 
@@ -503,10 +511,103 @@ defmodule Hologram.LiveReloadTest do
         end)
 
       assert log =~ "Hologram: live reload pass failed"
+      assert {:error, reason} = LiveReload.await_idle()
+      assert reason =~ "expected test error"
 
       send(pid, {:debounced_reload, "second.ex"})
 
       assert_receive :second_started
+    end
+
+    test "await_idle/1 returns :ok at once when no pass runs", %{pid: _pid} do
+      assert LiveReload.await_idle() == :ok
+    end
+
+    test "await_idle/1 waits for the running pass and returns its result", %{pid: pid} do
+      test_pid = self()
+
+      expect(LiveReloadMock, :reload, fn _file_path, _endpoint, _opts ->
+        send(test_pid, {:started, self()})
+
+        receive do
+          :continue -> :ok
+        end
+      end)
+
+      send(pid, {:debounced_reload, @file_path})
+      assert_receive {:started, task_pid}
+
+      request = Task.async(fn -> LiveReload.await_idle() end)
+
+      wait_until(fn -> :sys.get_state(pid).idle_waiters != [] end)
+      assert Task.yield(request, 50) == nil
+
+      send(task_pid, :continue)
+
+      assert Task.await(request) == :ok
+    end
+
+    test "await_idle/1 waits for a debounced save, and for the pass it starts", %{pid: pid} do
+      test_pid = self()
+
+      expect(LiveReloadMock, :reload, fn _file_path, _endpoint, _opts ->
+        send(test_pid, :started)
+        :ok
+      end)
+
+      send(pid, {:file_event, self(), {@file_path, [:modified]}})
+
+      request = Task.async(fn -> LiveReload.await_idle() end)
+
+      wait_until(fn -> :sys.get_state(pid).idle_waiters != [] end)
+      refute_received :started
+
+      assert Task.await(request, @debounce_delay + 1_000) == :ok
+      assert_received :started
+    end
+
+    test "await_idle/1 returns the compiler's output when the code did not compile", %{pid: pid} do
+      expect(LiveReloadMock, :reload, fn _file_path, _endpoint, _opts ->
+        {:error, "** (CompileError) lib/my_page.ex:3: undefined variable"}
+      end)
+
+      send(pid, {:debounced_reload, @file_path})
+      wait_until(fn -> :sys.get_state(pid).pass == nil end)
+
+      assert LiveReload.await_idle() ==
+               {:error, "** (CompileError) lib/my_page.ex:3: undefined variable"}
+    end
+
+    test "await_idle/1 answers after the pass a save during a pass starts", %{pid: pid} do
+      test_pid = self()
+
+      expect(LiveReloadMock, :reload, 2, fn
+        "first.ex", _endpoint, _opts ->
+          send(test_pid, {:first_started, self()})
+
+          receive do
+            :continue -> :ok
+          end
+
+        "second.ex", _endpoint, _opts ->
+          send(test_pid, :second_started)
+          :ok
+      end)
+
+      send(pid, {:debounced_reload, "first.ex"})
+      assert_receive {:first_started, task_pid}
+
+      send(pid, {:debounced_reload, "second.ex"})
+      :sys.get_state(pid)
+
+      request = Task.async(fn -> LiveReload.await_idle() end)
+      wait_until(fn -> :sys.get_state(pid).idle_waiters != [] end)
+
+      send(task_pid, :continue)
+      assert_receive :second_started
+
+      assert Task.await(request) == :ok
+      assert :sys.get_state(pid).idle_waiters == []
     end
 
     test "a request for a page that is not pending gets its bundle at once", %{pid: _pid} do
