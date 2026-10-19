@@ -841,6 +841,10 @@ export default class Interpreter {
   }
 
   static isStrictlyEqual(left, right) {
+    // Terms are immutable, so one object is always equal to itself. Renders compare large unchanged
+    // states this way, where most subterms are shared.
+    if (left === right) return true;
+
     const leftType = left.type;
 
     if (leftType !== right.type) return false;

@@ -18,7 +18,7 @@ import Type from "./type.mjs";
 import Utils from "./utils.mjs";
 import Vdom from "./vdom.mjs";
 
-import {h as vnode} from "./vendor/snabbdom/build/index.js";
+import {h as vnode, vnode as rawVnode} from "./vendor/snabbdom/build/index.js";
 import vnodeToHtml from "snabbdom-to-html";
 
 // The characters a value cannot carry into a script element as the text of a JavaScript string
@@ -158,6 +158,21 @@ export default class Renderer {
   // once `.elm` exists. renderPage() resets this.
   static resizeBindings = [];
 
+  // Set to false to evaluate every template on every render, e.g. to rule the cache out while
+  // debugging.
+  static memoize = true;
+
+  // The last render of each component, keyed by its place in the tree: the place of the component
+  // that rendered it plus its index among the components that one rendered. A render whose inputs
+  // equal the entry's reuses the entry's output instead of evaluating the template again. Only
+  // renderPage caches; Hologram clears this when it mounts a page.
+  static #memo = new Map();
+
+  // The components being rendered, innermost last, while renderPage runs; null otherwise. Each
+  // frame collects what its render read from outside its inputs (stateful components' registry
+  // entries) and the bindings it collected, so a later reuse can check the one and replay the other.
+  static #frames = null;
+
   // Based on Elixir Renderer.encode_tree/1, which it inverts clause for clause.
   //
   // The payload arrives already parsed out of the response body, so this is not a parse: it is
@@ -294,6 +309,20 @@ export default class Renderer {
     Renderer.reachBindings = [];
     Renderer.resizeBindings = [];
 
+    $.#frames = $.memoize ? [$.#newFrame("")] : null;
+
+    try {
+      return $.#renderPageVnode(pageModule, pageParams);
+    } finally {
+      $.#frames = null;
+    }
+  }
+
+  static clearMemo() {
+    $.#memo.clear();
+  }
+
+  static #renderPageVnode(pageModule, pageParams) {
     const pageModuleProxy = Interpreter.moduleProxy(pageModule);
 
     const cid = Type.bitstring("page");
@@ -306,10 +335,22 @@ export default class Renderer {
 
     // The document's own children, the one children list with no element to own it.
     const pageVdom = Vdom.finalizeChildren(
-      Renderer.#renderPageInsideLayout(
+      $.#memoized(
         pageModuleProxy,
-        pageParams,
-        pageComponentStruct,
+        [
+          pageParams,
+          Erlang_Maps["get/2"](Type.atom("state"), pageComponentStruct),
+          Erlang_Maps["get/2"](
+            Type.atom("emitted_context"),
+            pageComponentStruct,
+          ),
+        ],
+        () =>
+          Renderer.#renderPageInsideLayout(
+            pageModuleProxy,
+            pageParams,
+            pageComponentStruct,
+          ),
       ),
     );
 
@@ -664,6 +705,12 @@ export default class Renderer {
   // inert until then, like a DOM-element once binding - click_outside does not go through
   // #buildEventHandler, so its once is wired here rather than inheriting the shared dispatch path.
   static #collectClickOutsideBindings(attrsDom, elementVnode, defaultTarget) {
+    $.#recordBinding(
+      $.#collectClickOutsideBindings,
+      [attrsDom, elementVnode, defaultTarget],
+      attrsDom,
+    );
+
     attrsDom.data.forEach((attrDom, attrIndex) => {
       if ($.#eventAttributeName(attrDom) !== "$click_outside") {
         return;
@@ -726,6 +773,12 @@ export default class Renderer {
   // target share a currentTarget. A bare tag (no attributes) records nothing. A listener target has
   // no element tag name, so event-name mapping is skipped (passed null).
   static #collectListenerBindings(target, attrsDom, defaultTarget) {
+    $.#recordBinding(
+      $.#collectListenerBindings,
+      [target, attrsDom, defaultTarget],
+      attrsDom,
+    );
+
     attrsDom.data.forEach((attrDom) => {
       const slotKey = $.listenerBindings.length;
 
@@ -764,6 +817,12 @@ export default class Renderer {
   // container). The Hologram event type is "reach_<edge>", which selects ReachEvent and carries the
   // edge for a handler that branches on it.
   static #collectReachBindings(attrsDom, elementVnode, defaultTarget) {
+    $.#recordBinding(
+      $.#collectReachBindings,
+      [attrsDom, elementVnode, defaultTarget],
+      attrsDom,
+    );
+
     attrsDom.data.forEach((attrDom, attrIndex) => {
       const attributeName = $.#eventAttributeName(attrDom);
 
@@ -807,6 +866,12 @@ export default class Renderer {
   // window on the entry's target (the observed element), as a ResizeObserverEntry has no
   // currentTarget. The Hologram event type is "resize", the same one the window binding dispatches.
   static #collectResizeBindings(attrsDom, elementVnode, defaultTarget) {
+    $.#recordBinding(
+      $.#collectResizeBindings,
+      [attrsDom, elementVnode, defaultTarget],
+      attrsDom,
+    );
+
     attrsDom.data.forEach((attrDom, attrIndex) => {
       if ($.#eventAttributeName(attrDom) !== "$resize") {
         return;
@@ -1453,6 +1518,162 @@ export default class Renderer {
     }
   }
 
+  // Renders through the memo: reuses the output of the last render at this place when its module,
+  // its inputs and the registry entries it read are all unchanged, and renders afresh otherwise.
+  //
+  // A reused output is a copy, not the cached vnodes themselves: the cached vnodes may sit in the
+  // previous virtual document at another place, and a patch writes .elm into whichever vnode it
+  // meets. The copy shares each vnode's attrs and hooks, so the patch still finds them unchanged.
+  static #memoized(moduleProxy, inputs, render) {
+    const frames = $.#frames;
+
+    if (frames === null) {
+      return render();
+    }
+
+    const parent = frames.at(-1);
+    const place = `${parent.place}/${parent.childCount++}`;
+    const cached = $.#memo.get(place);
+
+    if (cached !== undefined && $.#isMemoCurrent(cached, moduleProxy, inputs)) {
+      return $.#reuseMemo(cached, parent);
+    }
+
+    const frame = $.#newFrame(place);
+    frames.push(frame);
+
+    let output;
+
+    try {
+      output = render();
+    } finally {
+      frames.pop();
+    }
+
+    $.#memo.set(place, {
+      moduleProxy,
+      template: moduleProxy["template/0"],
+      inputs,
+      output,
+      deps: frame.deps,
+      bindings: frame.bindings,
+    });
+
+    parent.deps.push(...frame.deps);
+    parent.bindings.push(...frame.bindings);
+
+    return output;
+  }
+
+  static #isMemoCurrent(entry, moduleProxy, inputs) {
+    return (
+      entry.moduleProxy === moduleProxy &&
+      entry.template === moduleProxy["template/0"] &&
+      inputs.every((input, index) =>
+        $.#isSameTerm(input, entry.inputs[index]),
+      ) &&
+      entry.deps.every(
+        (dep) =>
+          ComponentRegistry.isCidRegistered(dep.cid) &&
+          $.#isSameTerm(
+            ComponentRegistry.getComponentModule(dep.cid),
+            dep.module,
+          ) &&
+          $.#isSameTerm(
+            ComponentRegistry.getComponentState(dep.cid),
+            dep.state,
+          ) &&
+          $.#isSameTerm(
+            ComponentRegistry.getComponentEmittedContext(dep.cid),
+            dep.emittedContext,
+          ),
+      )
+    );
+  }
+
+  // Inputs are boxed terms, or null/strings for the tag and module a component sits in.
+  static #isSameTerm(left, right) {
+    if (left === right) {
+      return true;
+    }
+
+    if (left === null || right === null || typeof left !== "object") {
+      return false;
+    }
+
+    return Interpreter.isStrictlyEqual(left, right);
+  }
+
+  static #newFrame(place) {
+    return {place, childCount: 0, deps: [], bindings: []};
+  }
+
+  // Records a binding collector's call while renderPage runs, so a reused output can collect the
+  // same bindings for the copies of the vnodes the original call was given.
+  static #recordBinding(collector, args, attrsDom) {
+    if ($.#frames !== null && attrsDom.data.length > 0) {
+      $.#frames.at(-1).bindings.push({collector, args});
+    }
+  }
+
+  static #reuseMemo(entry, parent) {
+    const copies = new Map();
+
+    const output = entry.output.map((node) =>
+      typeof node === "string" ? node : $.#copyVnode(node, copies, true),
+    );
+
+    // The collectors record into the parent frame again, and the registry gets back the props a
+    // render writes, which equal the ones it holds unless something replaced the struct since.
+    for (const {collector, args} of entry.bindings) {
+      collector(...args.map((arg) => copies.get(arg) ?? arg));
+    }
+
+    for (const dep of entry.deps) {
+      ComponentRegistry.putComponentProps(dep.cid, dep.props);
+    }
+
+    parent.deps.push(...entry.deps);
+
+    return output;
+  }
+
+  // A top-level vnode goes into a children list that numbers repeated keys afresh, so it gets the
+  // key it had before the last list renumbered it. Deeper lists were numbered within the output.
+  // The "on" map is a new object so the patch hands the element's listener on to the copy.
+  static #copyVnode(original, copies, isTopLevel) {
+    const key = isTopLevel ? Vdom.baseKey(original) : original.key;
+    let data = original.data;
+
+    if (data !== undefined) {
+      data = {...data};
+
+      if (data.on !== undefined) {
+        data.on = {...data.on};
+      }
+
+      if (data.key !== undefined) {
+        data.key = key;
+      }
+    }
+
+    const children = original.children?.map((child) =>
+      $.#copyVnode(child, copies, false),
+    );
+
+    const copy = rawVnode(
+      original.sel,
+      data,
+      children,
+      original.text,
+      undefined,
+    );
+    copy.key = key;
+    copies.set(original, copy);
+
+    return copy;
+  }
+
   // WARNING: must match merge_neighbouring_text_nodes/1 on the server: adjacent text nodes join
   // into one, other nodes pass through.
   static #mergeNeighbouringTextNodes(nodes) {
@@ -1697,26 +1918,39 @@ export default class Renderer {
 
     Renderer.#validateProps(props, moduleProxy, dom.data[1], parentModule);
 
-    if (Renderer.#hasCidProp(props)) {
-      return Renderer.#renderStatefulComponent(
-        moduleProxy,
-        props,
-        expandedChildrenDom,
-        context,
-        parentTagName,
-        parentModule,
-      );
-    } else {
-      return Renderer.#renderTemplate(
-        moduleProxy,
-        props,
-        expandedChildrenDom,
-        context,
-        defaultTarget,
-        parentTagName,
-        parentModule,
-      );
-    }
+    // Everything the render below reads apart from the registry entries of stateful components,
+    // which the frame records as it meets them.
+    const inputs = [
+      props,
+      expandedChildrenDom,
+      context,
+      defaultTarget,
+      parentTagName,
+      parentModule,
+    ];
+
+    return $.#memoized(moduleProxy, inputs, () => {
+      if (Renderer.#hasCidProp(props)) {
+        return Renderer.#renderStatefulComponent(
+          moduleProxy,
+          props,
+          expandedChildrenDom,
+          context,
+          parentTagName,
+          parentModule,
+        );
+      } else {
+        return Renderer.#renderTemplate(
+          moduleProxy,
+          props,
+          expandedChildrenDom,
+          context,
+          defaultTarget,
+          parentTagName,
+          parentModule,
+        );
+      }
+    });
   }
 
   // Based on render_tree/3 (dynamic tag cases)
@@ -2157,6 +2391,14 @@ export default class Renderer {
     // value the latest render used rather than one taken when the component mounted. Runs after
     // #maybeInitComponent, which is what creates the registry entry on a first render.
     ComponentRegistry.putComponentProps(cid, props);
+
+    $.#frames?.at(-1).deps.push({
+      cid,
+      module: moduleProxy.__exModule__,
+      props,
+      state: componentState,
+      emittedContext: componentEmittedContext,
+    });
 
     const vars = Erlang_Maps["merge/2"](props, componentState);
     const mergedContext = Erlang_Maps["merge/2"](

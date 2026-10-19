@@ -1362,6 +1362,9 @@ export default class Hologram {
     // here the page on screen and the page the registry answers for are the same page.
     $.domEpoch = $.registryEpoch = Math.max($.domEpoch, $.registryEpoch);
 
+    // A mount starts from a new registry and possibly new page code, so no earlier render is reused.
+    Renderer.clearMemo();
+
     let mountData = null;
 
     if ($.#shouldLoadMountData) {
