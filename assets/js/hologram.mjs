@@ -1678,6 +1678,9 @@ export default class Hologram {
     // Nothing runs until the first render below has written the props - see the flag.
     $.isMounting = true;
 
+    // A mount starts from a new registry and possibly new page code, so no earlier render is reused.
+    Renderer.clearMemo();
+
     let mountData = null;
 
     if ($.#shouldLoadMountData) {
