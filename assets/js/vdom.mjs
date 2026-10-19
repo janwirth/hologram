@@ -10,6 +10,15 @@ import {
 const patch = init([attributesModule, eventListenersModule]);
 
 export default class Vdom {
+  // The key each renumbered vnode had before dedupeKeys gave it a ":n" suffix. A vnode the renderer
+  // reuses from an earlier render goes into a new children list, which numbers it afresh.
+  static #baseKeys = new WeakMap();
+
+  // The key a vnode had before any children list renumbered it.
+  static baseKey(vnode) {
+    return $.#baseKeys.has(vnode) ? $.#baseKeys.get(vnode) : vnode.key;
+  }
+
   // Numbers repeats of a key within one children list, in document order: the second occurrence
   // becomes "<key>:1", the third "<key>:2".
   //
@@ -43,6 +52,7 @@ export default class Vdom {
       if (count > 0) {
         const dedupedKey = `${child.key}:${count}`;
 
+        $.#baseKeys.set(child, child.key);
         child.key = dedupedKey;
         child.data.key = dedupedKey;
       }
