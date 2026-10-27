@@ -410,7 +410,7 @@ defmodule Hologram.Realtime.SSE do
 
     case Handshake.redeem(handshake_id, server_wait_ms) do
       {:ok, validated_bindings, ^claimed} ->
-        configure_backpressure_safety_net()
+        previous_max_heap_size = configure_backpressure_safety_net()
 
         heartbeat_interval_ms =
           Keyword.get(opts, :heartbeat_interval_ms, heartbeat_interval_ms(conn))
@@ -444,6 +444,7 @@ defmodule Hologram.Realtime.SSE do
         |> prepare()
         |> watch_client(adapter)
         |> message_pump(session_id, user_id, message_pump_opts)
+        |> tap(fn _conn -> Process.flag(:max_heap_size, previous_max_heap_size) end)
 
       :error ->
         reject_4xx(conn, "Handshake redemption failed")
@@ -608,7 +609,10 @@ defmodule Hologram.Realtime.SSE do
   # accumulating broadcasts in its mailbox. Depends on the default `:on_heap`
   # mailbox - do NOT switch the SSE process to `message_queue_data: :off_heap`
   # without revisiting this guard, since off-heap message data is not counted
-  # against `:max_heap_size`.
+  # against `:max_heap_size`. Returns the previous setting: the process is the
+  # adapter's connection process, which serves the next keep-alive request once
+  # the stream ends, so stream/2 restores it (a cap left behind killed an
+  # ordinary page render of a large page).
   defp configure_backpressure_safety_net do
     Process.flag(:max_heap_size, %{
       size: @max_heap_size_words,

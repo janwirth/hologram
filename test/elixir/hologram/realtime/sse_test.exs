@@ -1726,6 +1726,24 @@ defmodule Hologram.Realtime.SSETest do
       Process.exit(pid, :kill)
     end
 
+    # The process is the adapter's connection process: after the stream it
+    # serves the next keep-alive request, which must not inherit the cap.
+    test "restores the previous max_heap_size flag when the stream ends" do
+      conn = conn_with_instance_id()
+      test_pid = self()
+
+      pid =
+        spawn(fn ->
+          stream(conn)
+          send(test_pid, {:after_stream, Process.info(self(), :max_heap_size)})
+        end)
+
+      Process.sleep(50)
+      send(pid, {:close, :superseded})
+
+      assert_receive {:after_stream, {:max_heap_size, %{size: 0}}}
+    end
+
     test "listens for live reload in the dev and test envs" do
       for env <- ["dev", "test"] do
         put_hologram_env(env)
