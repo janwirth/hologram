@@ -973,7 +973,11 @@ export default class Hologram {
       // Successfully saved to OPFS, clear session storage
       sessionStorage.removeItem(storageKey);
     } catch (opfsError) {
-      console.error("Failed to save ETS to OPFS:", opfsError);
+      // Firefox throws SecurityError when the site may not store data (private window,
+      // site data blocked): session storage keeps the data, so there is nothing to report.
+      if (opfsError?.name !== "SecurityError") {
+        console.error("Failed to save ETS to OPFS:", opfsError);
+      }
       // Session storage still has the data as fallback
     }
   }
@@ -2674,7 +2678,11 @@ export default class Hologram {
       // Successfully saved to OPFS, clear session storage fallback if it exists
       sessionStorage.removeItem(snapshotKey);
     } catch (opfsError) {
-      console.error("Failed to save page snapshot to OPFS:", opfsError);
+      // Firefox throws SecurityError when the site may not store data (private window,
+      // site data blocked): session storage keeps the data, so there is nothing to report.
+      if (opfsError?.name !== "SecurityError") {
+        console.error("Failed to save page snapshot to OPFS:", opfsError);
+      }
 
       // Fallback to session storage if OPFS fails
       try {
