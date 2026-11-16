@@ -5423,6 +5423,82 @@ describe("Hologram", () => {
     });
   });
 
+  // A click on the server's HTML before the runtime rendered reached no listener and was lost
+  // (seen with a Lightpanda scenario on a page whose bundle loads after the HTML).
+  describe("replayEarlyEvents()", () => {
+    let recorder = null;
+
+    const record = (events) => {
+      recorder = sinon.spy();
+      globalThis.Hologram ??= {};
+      globalThis.Hologram._earlyEvents = events;
+      globalThis.Hologram._recordEarlyEvent = recorder;
+    };
+
+    afterEach(() => {
+      delete globalThis.Hologram._earlyEvents;
+      delete globalThis.Hologram._recordEarlyEvent;
+      document.body.innerHTML = "";
+      sinon.restore();
+    });
+
+    it("dispatches each recorded event again on its element, once", () => {
+      document.body.innerHTML = '<button id="b">+1</button><input id="i" />';
+      const button = document.getElementById("b");
+      const input = document.getElementById("i");
+
+      const clickEvent = new MouseEvent("click", {bubbles: true});
+      button.dispatchEvent(clickEvent);
+      const inputEvent = new Event("input", {bubbles: true});
+      input.dispatchEvent(inputEvent);
+
+      record([clickEvent, inputEvent]);
+
+      const clicks = sinon.spy();
+      const inputs = sinon.spy();
+      button.addEventListener("click", clicks);
+      input.addEventListener("input", inputs);
+
+      Hologram.replayEarlyEvents();
+      Hologram.replayEarlyEvents();
+
+      sinon.assert.calledOnce(clicks);
+      sinon.assert.calledOnce(inputs);
+      assert.isUndefined(globalThis.Hologram._earlyEvents);
+      assert.isUndefined(globalThis.Hologram._recordEarlyEvent);
+    });
+
+    it("skips elements the render removed and clicks the browser already acted on", () => {
+      document.body.innerHTML =
+        '<a id="a" href="#x">link</a><input id="c" type="checkbox" /><button id="gone"></button>';
+
+      const link = document.getElementById("a");
+      const checkbox = document.getElementById("c");
+      const gone = document.getElementById("gone");
+
+      const events = [link, checkbox, gone].map((el) => {
+        const event = new MouseEvent("click", {bubbles: true});
+        el.dispatchEvent(event);
+        return event;
+      });
+
+      gone.remove();
+      record(events);
+
+      const clicks = sinon.spy();
+      document.addEventListener("click", clicks);
+
+      Hologram.replayEarlyEvents();
+
+      document.removeEventListener("click", clicks);
+      sinon.assert.notCalled(clicks);
+    });
+
+    it("does nothing when the page recorded nothing", () => {
+      assert.doesNotThrow(() => Hologram.replayEarlyEvents());
+    });
+  });
+
   describe("render()", () => {
     let clock = null;
 

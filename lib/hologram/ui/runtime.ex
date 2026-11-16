@@ -9,6 +9,9 @@ defmodule Hologram.UI.Runtime do
   prop :page_module, :module, from_context: {Hologram.Runtime, :page_module}
   prop :page_mounted?, :boolean, from_context: {Hologram.Runtime, :page_mounted?}
 
+  # The first script also records the clicks and input that reach the page before the runtime has
+  # rendered it (the server's HTML has no listeners yet, and a page bundle can take seconds to
+  # load); the runtime replays them after its first render (`Hologram.replayEarlyEvents`).
   @impl Component
   def template do
     ~HOLO"""
@@ -26,6 +29,14 @@ defmodule Hologram.UI.Runtime do
         globalThis.Hologram.dispatchAction = function(actionName, target, params) \{
           globalThis.Hologram._pendingJsInteropActions.push([actionName, target, params]);
         \}
+
+        globalThis.Hologram._earlyEvents = [];
+        globalThis.Hologram._recordEarlyEvent = function(event) \{
+          globalThis.Hologram._earlyEvents.push(event);
+        \};
+        ["click", "input", "change"].forEach(function(type) \{
+          document.addEventListener(type, globalThis.Hologram._recordEarlyEvent, true);
+        \});
       </script>
     {/if}
 

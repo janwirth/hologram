@@ -58,6 +58,14 @@ defmodule Hologram.UI.RuntimeTest do
     assert String.contains?(markup, "globalThis.Hologram.csrfToken")
     assert String.contains?(markup, "globalThis.Hologram.dispatchAction")
 
+    # records the clicks and input before the runtime renders (Hologram.replayEarlyEvents)
+    assert String.contains?(markup, "globalThis.Hologram._earlyEvents = [];")
+
+    assert String.contains?(
+             markup,
+             "document.addEventListener(type, globalThis.Hologram._recordEarlyEvent, true);"
+           )
+
     assert String.contains?(
              markup,
              "globalThis.Hologram.identityTag = $IDENTITY_TAG_JS_PLACEHOLDER;"

@@ -830,6 +830,9 @@ export default class Hologram {
 
     console.log("Hologram: page rendered in", PerformanceTimer.diff(startTime));
 
+    // The page's listeners are live from here, so what the user did before is handed to them.
+    Hologram.replayEarlyEvents();
+
     // Run after the reconcile above rather than straight after the patch: a waiting action
     // renders, and a render collects the page's <window>/<document> bindings into
     // Renderer.listenerBindings. Running one earlier would leave this render reconciling the
@@ -839,6 +842,42 @@ export default class Hologram {
     // document describing different pages, and running the queue against that repairs nothing -
     // it waits for the next render that finishes.
     Hologram.#runActions();
+  }
+
+  // Made public to make tests easier
+  //
+  // Replays the clicks and input the page's first script recorded (Hologram.UI.Runtime) while the
+  // server's HTML had no listeners: a click on a button before the runtime rendered did nothing,
+  // and was lost. Each is dispatched again on its element, if the render kept it. Runs once: the
+  // recorder is removed. A click whose browser default already acted (a link followed, a checkbox
+  // or radio toggled, through its label too) is not replayed: its change event carries it.
+  static replayEarlyEvents() {
+    const events = globalThis.Hologram?._earlyEvents;
+    const recorder = globalThis.Hologram?._recordEarlyEvent;
+
+    if (!events) return;
+
+    ["click", "input", "change"].forEach((type) =>
+      document.removeEventListener(type, recorder, true),
+    );
+
+    delete globalThis.Hologram._earlyEvents;
+    delete globalThis.Hologram._recordEarlyEvent;
+
+    events.forEach((event) => {
+      const target = event.target;
+
+      if (!target?.isConnected) return;
+      if (event.type === "click" && $.#clickActedNatively(target)) return;
+
+      target.dispatchEvent(new event.constructor(event.type, event));
+    });
+  }
+
+  static #clickActedNatively(target) {
+    return !!target.closest?.(
+      "a[href], label, input[type=checkbox], input[type=radio]",
+    );
   }
 
   // Made public to make tests easier
