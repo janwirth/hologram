@@ -2,6 +2,7 @@ defmodule Hologram.Realtime.SSE do
   @moduledoc false
 
   alias Hologram.Assets.ChunkRegistry
+  alias Hologram.Assets.PathRegistry, as: AssetPathRegistry
   alias Hologram.Compiler.Encoder
   alias Hologram.Component.Action
   alias Hologram.LiveReload
@@ -96,6 +97,17 @@ defmodule Hologram.Realtime.SSE do
   @spec encode_compiled_envelope(integer) :: String.t()
   def encode_compiled_envelope(id) do
     "event: compiled\nid: #{id}\ndata:\n\n"
+  end
+
+  @doc """
+  Builds the SSE event-stream chunk for a `css_changed` event: the standard
+  `event:`/`id:`/`data:` framing with the given id, and the given asset paths of
+  the app, by static path, as plain JSON, so that the tab can follow a
+  stylesheet whose URL changed.
+  """
+  @spec encode_css_changed_envelope(integer, %{String.t() => String.t()}) :: String.t()
+  def encode_css_changed_envelope(id, app_asset_paths) do
+    "event: css_changed\nid: #{id}\ndata: #{Jason.encode!(app_asset_paths)}\n\n"
   end
 
   @doc """
@@ -294,6 +306,27 @@ defmodule Hologram.Realtime.SSE do
           {:error, _reason} -> {:halt, conn}
         end
 
+      # The app's CSS changed. Forwarded to every tab, which swaps its stylesheets in place, with
+      # the app's asset paths as they are when the event is written, which a replay to a tab that
+      # missed several changes needs too. Hologram's own bundles are left out: the tab keeps the
+      # ones its document loaded.
+      :css_changed ->
+        id = System.unique_integer([:positive, :monotonic])
+
+        asset_paths = AssetPathRegistry.get_mapping()
+
+        app_asset_paths =
+          Map.reject(asset_paths, fn {static_path, _asset_path} ->
+            String.starts_with?(static_path, "hologram/")
+          end)
+
+        chunk_data = encode_css_changed_envelope(id, app_asset_paths)
+
+        case Plug.Conn.chunk(conn, chunk_data) do
+          {:ok, conn} -> {:cont, conn}
+          {:error, _reason} -> {:halt, conn}
+        end
+
       {:drop_channel, channel} ->
         conn = Plug.Conn.fetch_query_params(conn)
         instance_id = conn.query_params["instance_id"]
@@ -347,7 +380,9 @@ defmodule Hologram.Realtime.SSE do
         end
 
       # A live reload rebuilt these pages' bundles. Every tab gets the list, and the
-      # client decides whether the page it shows is among them.
+      # client decides whether the page it shows is among them. As :all, every tab
+      # reloads: the runtime or chunk bundles were rebuilt, or an asset of the app other
+      # than CSS changed.
       {:reload, pages} ->
         id = System.unique_integer([:positive, :monotonic])
         chunk_data = encode_reload_envelope(id, pages)
@@ -733,11 +768,13 @@ defmodule Hologram.Realtime.SSE do
   # The outcome of the last live reload is asked for once subscribed, since a broadcast reaches
   # only the streams attached when it is sent: a tab reloaded while a live reload was still
   # building, or one reconnecting, would otherwise miss the compilation error, or keep one a
-  # later live reload compiled past.
+  # later live reload compiled past. A change to the app's assets the tab missed is asked for too,
+  # since the tab would otherwise keep the assets its document loaded.
   defp maybe_subscribe_to_live_reload(conn) do
     if Hologram.env() in [:dev, :test] do
       Phoenix.PubSub.subscribe(Hologram.PubSub, "hologram_live_reload")
       LiveReload.replay_outcome(self())
+      LiveReload.replay_asset_change(self(), conn.query_params["instance_id"])
     end
 
     conn

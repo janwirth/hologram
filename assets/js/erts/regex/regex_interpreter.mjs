@@ -22,7 +22,7 @@ import {
   NEWLINE_SINGLES,
 } from "./regex_newlines.mjs";
 
-import {applyOptionSetting, mergeStartOptions} from "./regex_options.mjs";
+import {applyOptionSetting, startOptionSettings} from "./regex_options.mjs";
 
 // The PCRE2 version emulated by the (?(VERSION condition, matching the
 // version Erlang/OTP ships.
@@ -61,6 +61,17 @@ class SkipSignal {
 class ThenSignal {}
 
 export default class RegexInterpreter {
+  // Builds the subroutine call table: group number → group node, with 0
+  // mapping to the whole pattern. The first definition wins for numbers
+  // repeated in branch reset groups.
+  static buildSubroutineTable(ast) {
+    const table = new Map([[0, ast]]);
+
+    $.#collectSubroutines(ast, table);
+
+    return table;
+  }
+
   // Matches a parsed pattern against a subject string, scanning forward from
   // the start position. Returns {start, end, captures} of the first match,
   // or null. captures[n] holds {start, end} of group n, or null when the
@@ -72,6 +83,14 @@ export default class RegexInterpreter {
   // (everywhere or at the start position only) during backtracking, so a
   // longer match at the same position can still be found.
   //
+  // opts.subjectCache holds data derived from the subject alone, so calls on
+  // the same subject can share it instead of each deriving it again. It is
+  // {graphemeSegments: null} to start, filled in when first needed.
+  //
+  // opts.groupMap, opts.startOptionSettings and opts.subroutines hold data
+  // derived from the pattern alone, built here when not given, so a caller
+  // that matches one pattern many times can build them once.
+  //
   // Matching uses continuation-passing style: each node matcher calls the
   // continuation with the position after itself, and returning false makes
   // the caller backtrack to its next alternative.
@@ -79,7 +98,7 @@ export default class RegexInterpreter {
     const groupMap = opts.groupMap ?? RegexAnalyzer.buildGroupMap(ast);
     const groupCount = groupMap.count;
 
-    const effectiveOpts = mergeStartOptions(ast, opts);
+    const settings = opts.startOptionSettings ?? startOptionSettings(ast);
     const startPosition = opts.startPosition ?? 0;
 
     const maxStartPosition = Math.min(
@@ -88,29 +107,33 @@ export default class RegexInterpreter {
     );
 
     const state = {
-      bsrAnycrlf: effectiveOpts.bsr_anycrlf === true,
+      bsrAnycrlf: (settings.bsr_anycrlf ?? opts.bsr_anycrlf) === true,
       callStack: [],
       captures: [],
-      caseless: effectiveOpts.caseless === true,
-      dollarEndonly: effectiveOpts.dollar_endonly === true,
-      dotall: effectiveOpts.dotall === true,
+      caseless: opts.caseless === true,
+      dollarEndonly: opts.dollar_endonly === true,
+      dotall: opts.dotall === true,
       groupNames: groupMap.names,
       marks: [],
-      matchLimit: effectiveOpts.matchLimit ?? 10_000_000,
-      matchLimitRecursion: effectiveOpts.matchLimitRecursion ?? 10_000_000,
-      multiline: effectiveOpts.multiline === true,
-      newline: effectiveOpts.newline ?? "lf",
+      matchLimit: $.#effectiveLimit(opts.matchLimit, settings.matchLimit),
+      matchLimitRecursion: $.#effectiveLimit(
+        opts.matchLimitRecursion,
+        settings.matchLimitRecursion,
+      ),
+      multiline: opts.multiline === true,
+      newline: settings.newline ?? opts.newline ?? "lf",
       notbol: opts.notbol === true,
       noteol: opts.noteol === true,
       openGroups: [],
       // Mutable scalars boxed to stay shared by reference when option
       // settings copy the state, like the capture and mark containers
-      shared: {depth: 0, graphemeSegments: null, reportedStart: null, steps: 0},
+      shared: {depth: 0, reportedStart: null, steps: 0},
       startOffset: startPosition,
       subject: subject,
-      subroutines: $.#buildSubroutineTable(ast),
-      ungreedy: effectiveOpts.ungreedy === true,
-      unicode: effectiveOpts.unicode === true,
+      subjectCache: opts.subjectCache ?? {graphemeSegments: null},
+      subroutines: opts.subroutines ?? $.buildSubroutineTable(ast),
+      ungreedy: opts.ungreedy === true,
+      unicode: opts.unicode === true || settings.unicode === true,
     };
 
     let start = startPosition;
@@ -227,17 +250,6 @@ export default class RegexInterpreter {
     }
 
     return true;
-  }
-
-  // Builds the subroutine call table: group number → group node, with 0
-  // mapping to the whole pattern. The first definition wins for numbers
-  // repeated in branch reset groups.
-  static #buildSubroutineTable(ast) {
-    const table = new Map([[0, ast]]);
-
-    $.#collectSubroutines(ast, table);
-
-    return table;
   }
 
   static #charLength(state, position) {
@@ -383,6 +395,14 @@ export default class RegexInterpreter {
           `unsupported condition for interpretation: ${condition.kind}`,
         );
     }
+  }
+
+  // Returns the lower of a run limit and a start limit verb's value, either
+  // possibly undefined, or the default limit when neither is set.
+  static #effectiveLimit(runLimit, verbLimit) {
+    if (runLimit === undefined && verbLimit === undefined) return 10_000_000;
+
+    return Math.min(runLimit ?? Infinity, verbLimit ?? Infinity);
   }
 
   // Returns true at the subject end, or right before a newline sequence that
@@ -703,13 +723,14 @@ export default class RegexInterpreter {
       case "graphemeCluster": {
         if (position >= state.subject.length) return false;
 
-        if (state.shared.graphemeSegments === null) {
-          state.shared.graphemeSegments = ERTS.graphemeSegmenter.segment(
-            state.subject,
-          );
-        }
+        // Kept per subject, since finding the segment at a position in a
+        // fresh split walks the subject from the start
+        state.subjectCache.graphemeSegments ??= ERTS.graphemeSegmenter.segment(
+          state.subject,
+        );
 
-        const segment = state.shared.graphemeSegments.containing(position);
+        const segment =
+          state.subjectCache.graphemeSegments.containing(position);
 
         return continuation(segment.index + segment.segment.length);
       }

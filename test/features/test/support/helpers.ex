@@ -7,6 +7,7 @@ defmodule HologramFeatureTests.Helpers do
   alias Hologram.Realtime
   alias Hologram.Realtime.SSE
   alias Hologram.Realtime.SubscriptionRegistry
+  alias Hologram.Reflection
   alias Hologram.Router.Helpers, as: RouterHelpers
   alias HologramFeatureTestsWeb.Endpoint
   alias HologramFeatureTestsWeb.Plugs.SlowPageBundle
@@ -199,8 +200,8 @@ defmodule HologramFeatureTests.Helpers do
   """
   @spec chunk_digests() :: [String.t()]
   def chunk_digests do
-    static_dir()
-    |> Path.join("hologram/chunk-????????.js")
+    Reflection.bundles_dir()
+    |> Path.join("chunk-????????.js")
     |> Path.wildcard()
     |> Enum.map(&Path.basename(&1, ".js"))
     |> Enum.map(&String.replace_prefix(&1, "chunk-", ""))
@@ -338,12 +339,30 @@ defmodule HologramFeatureTests.Helpers do
   end
 
   @doc """
+  Keeps the browser from putting the document the `session` shows into its back/forward cache,
+  so that coming back to it with Back or Forward loads a new document. Adds an `unload` listener,
+  which makes a page ineligible for Chrome's back/forward cache.
+  """
+  def keep_out_of_back_forward_cache(session) do
+    Browser.execute_script(session, "window.addEventListener('unload', () => {});")
+  end
+
+  @doc """
+  Marks the document the `session` shows, so that `wait_for_unmarked_document/2` can tell when
+  the browser has replaced it with a new one.
+  """
+  def mark_document(session) do
+    Browser.execute_script(session, "globalThis.__hologramMarkedDocument = true;")
+  end
+
+  @doc """
   Returns the content of the chunk bundle with the given digest.
   """
   @spec read_chunk_bundle(String.t()) :: String.t()
   def read_chunk_bundle(digest) do
-    static_dir()
-    |> Path.join(RouterHelpers.chunk_bundle_path(digest))
+    digest
+    |> RouterHelpers.chunk_bundle_path()
+    |> bundle_file_path()
     |> File.read!()
   end
 
@@ -354,8 +373,9 @@ defmodule HologramFeatureTests.Helpers do
   def read_page_bundle(page_module) do
     digest = PageDigestRegistry.lookup(page_module)
 
-    static_dir()
-    |> Path.join(RouterHelpers.page_bundle_path(page_module, digest))
+    page_module
+    |> RouterHelpers.page_bundle_path(digest)
+    |> bundle_file_path()
     |> File.read!()
   end
 
@@ -365,8 +385,8 @@ defmodule HologramFeatureTests.Helpers do
   @spec read_runtime_bundle() :: String.t()
   def read_runtime_bundle do
     [runtime_bundle_path] =
-      static_dir()
-      |> Path.join("hologram/runtime-????????.js")
+      Reflection.bundles_dir()
+      |> Path.join("runtime-????????.js")
       |> Path.wildcard()
 
     File.read!(runtime_bundle_path)
@@ -734,6 +754,27 @@ defmodule HologramFeatureTests.Helpers do
   end
 
   @doc """
+  Blocks until the document `mark_document/1` marked has been replaced with a new one, then
+  returns the `session`. Raises if that does not happen within `@max_wait_time`.
+  """
+  def wait_for_unmarked_document(session, start_time \\ nil) do
+    start_time = start_time || current_time()
+
+    cond do
+      script_result(session, "return globalThis.__hologramMarkedDocument !== true;") ->
+        session
+
+      timed_out?(start_time) ->
+        raise Wallaby.ExpectationNotMetError,
+              "Timed out waiting for the browser to load a new document"
+
+      true ->
+        :timer.sleep(100)
+        wait_for_unmarked_document(session, start_time)
+    end
+  end
+
+  @doc """
   Blocks until the `session`'s own SSE process records `user_id`, then returns
   the `session`. Gates on a handler-driven identity change (login or logout)
   having propagated to the connection before its effects are asserted - e.g.
@@ -774,6 +815,12 @@ defmodule HologramFeatureTests.Helpers do
     Enum.any?(entry.bindings, fn {{ch, c}, _user_id} ->
       ch == channel and (is_nil(cid) or c == cid)
     end)
+  end
+
+  # The file the bundle at the given URL is served from, in the dir the compiler writes the bundles
+  # to.
+  defp bundle_file_path(bundle_url) do
+    Path.join(Reflection.bundles_dir(), Path.basename(bundle_url))
   end
 
   defp connection?(instance_id) do
@@ -848,10 +895,6 @@ defmodule HologramFeatureTests.Helpers do
       [{^instance_id, entry}] -> entry
       [] -> nil
     end
-  end
-
-  defp static_dir do
-    Application.app_dir(:hologram_feature_tests, "priv/static")
   end
 
   defp subscription_count(channel, cid) do

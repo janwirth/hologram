@@ -305,6 +305,7 @@ defmodule Hologram.Compiler.CallGraph do
     {{:re, :compile, 1}, {:re, :compile, 2}},
     {{:re, :compile, 2}, {:erlang, :iolist_to_binary, 1}},
     {{:re, :compile, 2}, {:erlang, :make_ref, 0}},
+    {{:re, :import, 1}, {:erlang, :make_ref, 0}},
     {{:re, :import, 1}, {:re, :compile, 2}},
     {{:re, :run, 2}, {:re, :run, 3}},
     {{:re, :run, 3}, {:erlang, :iolist_to_binary, 1}},
@@ -449,6 +450,8 @@ defmodule Hologram.Compiler.CallGraph do
       {:maps, :put, 3}
     ],
     interpreter_class: [
+      # Interpreter.raiseMisuseError raises this by name, for the reason given at renderer_class.
+      {Hologram.MisuseError, :message, 1},
       {Enum, :into, 2},
       {Enum, :to_list, 1},
       {Exception, :blame, 3},

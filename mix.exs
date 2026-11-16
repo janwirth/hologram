@@ -2,7 +2,7 @@
 defmodule Hologram.MixProject do
   use Mix.Project
 
-  @version "0.12.5"
+  @version "0.12.9"
 
   # Copied from Hologram.Commons.SystemUtils
   @windows_exec_suffixes [".bat", ".cmd", ".exe"]
@@ -97,6 +97,9 @@ defmodule Hologram.MixProject do
 
   def package do
     [
+      # Never "priv": Mix links a dep's build priv dir to the dep's own priv dir when it has one,
+      # and the compiler keeps each build env's bundles and compile state in its build priv dir
+      # (see Hologram.Reflection.bundles_dir/0), so every env would share them again.
       files: [
         "assets/js",
         "assets/package.json",
@@ -135,8 +138,11 @@ defmodule Hologram.MixProject do
         "Full stack isomorphic Elixir web framework that can be used on top of Phoenix.",
       dialyzer: [
         plt_add_apps: [:ex_unit, :iex, :mix, :wallaby],
-        plt_core_path: Path.join(["priv", "plts", "core.plt"]),
-        plt_local_path: Path.join(["priv", "plts", "project.plt"])
+        # Never in "priv": Mix links the build priv dir to the project's priv dir when it has one,
+        # and only the CI job that holds the PLTs would have it, so the build caches of the CI jobs
+        # would differ.
+        plt_core_path: Path.join(["plts", "core.plt"]),
+        plt_local_path: Path.join(["plts", "project.plt"])
       ],
       docs: [
         authors: ["Bart Blast"],

@@ -651,7 +651,8 @@ defmodule Hologram.Compiler do
   string names the build only, its output dir under the `:tmp_dir` opt, which keeps the entries of
   a shared bundle name apart while they are bundled at once: the chunks' files are named by the
   bundle name and the hash alone, since no two chunks have the same content. The returned digest is
-  the hash.
+  the hash. Next to the bundle goes its gzip copy, `<bundle_name>-<hash>.js.gz` (see
+  `gzip_path/1`).
 
   A bundle bigger than the `:max_bundle_size` config value fails the build, unless its bundle name
   is `"chunk"`: a chunk is downloaded only once a struct of one of its types is on the client, and
@@ -665,9 +666,10 @@ defmodule Hologram.Compiler do
   @spec bundle(module | String.t() | nil, T.file_path(), String.t(), T.opts()) :: map
   def bundle(entry_name, entry_file_path, bundle_name, opts) do
     # esbuild names the bundle and its source map by their content hash and writes the source map
-    # comment to match, so neither file is read back or rewritten. Each bundle gets its own output
-    # dir: the name is only known once esbuild has run, so the dir is listed for it, and it is
-    # recreated so that a bundle left there by a run that failed the size check is not listed too.
+    # comment to match, so the source map is never read back and neither file is rewritten. Each
+    # bundle gets its own output dir: the name is only known once esbuild has run, so the dir is
+    # listed for it, and it is recreated so that a bundle left there by a run that failed the size
+    # check is not listed too.
     output_name = bundle_output_name(bundle_name, entry_name)
     output_dir_name = bundle_output_dir_name(bundle_name, entry_name)
     output_dir = Path.join(opts[:tmp_dir], "#{output_dir_name}.output")
@@ -694,8 +696,8 @@ defmodule Hologram.Compiler do
     {static_bundle_path, static_source_map_path} =
       move_bundle_to_static_dir(output_dir, bundle_file_name, opts)
 
-    # Read once and removed, so that the output dir is left empty, as the bundle and its source map
-    # leave it.
+    # Read once and removed, so that the output dir is left empty, as the bundle, its gzip copy and
+    # its source map leave it.
     js_inputs =
       metafile_path
       |> read_esbuild_metafile()
@@ -976,6 +978,31 @@ defmodule Hologram.Compiler do
   end
 
   @doc """
+  Writes the module info PLT to the dump at the given path, with a new random token next to it that
+  tells this dump from any other (see `module_info_dump_stamp/1`). The token is written first, so
+  that a compile that dies between the two leaves a token no dump was written with.
+  """
+  @spec dump_module_info_plt(PLT.t(), T.file_path()) :: :ok
+  def dump_module_info_plt(plt, dump_path) do
+    token =
+      12
+      |> :crypto.strong_rand_bytes()
+      |> Base.url_encode64(padding: false)
+
+    dump_path
+    |> Path.dirname()
+    |> File.mkdir_p!()
+
+    dump_path
+    |> module_info_dump_token_path()
+    |> FileUtils.write_atomically!(token)
+
+    PLT.dump(plt, dump_path)
+
+    :ok
+  end
+
+  @doc """
   Encodes into the encode PLT every function of the given MFAs that is not there yet, reading each
   module's IR once however many entry files reach it. Erlang modules are skipped, and so are
   protocol modules, whose dispatcher functions depend on the entry file and are encoded per entry
@@ -1209,12 +1236,27 @@ defmodule Hologram.Compiler do
   end
 
   @doc """
-  Installs JavaScript deps which are specified in package.json located in assets_dir.
-  Saves the package.json digest to package_json_digest.bin file in build_dir.
+  Returns the path of the gzip copy of the bundle at the given path: the bundle's path with `.gz`
+  appended.
   """
-  @spec install_js_deps(T.file_path(), T.file_path()) :: :ok
+  @spec gzip_path(T.file_path()) :: T.file_path()
+  def gzip_path(bundle_path) do
+    bundle_path <> ".gz"
+  end
+
+  @doc """
+  Installs JavaScript deps which are specified in package.json located in assets_dir, and records
+  the package.json digest in the node_modules dir the install fills (see `maybe_install_js_deps/1`).
+  """
+  @spec install_js_deps(T.file_path()) :: :ok
   # sobelow_skip ["CI.System"]
-  def install_js_deps(assets_dir, build_dir) do
+  def install_js_deps(assets_dir) do
+    package_json_digest_path = package_json_digest_path(assets_dir)
+
+    # Gone before npm runs, so that an install that fails leaves no record of a finished one, which
+    # every build env would then trust.
+    File.rm(package_json_digest_path)
+
     # Run from the project root, not from inside assets_dir, so version managers like
     # asdf/mise resolve the Node.js version from the consuming project's config rather
     # than any .tool-versions inside a git-checked-out dependency. npm still installs
@@ -1229,9 +1271,9 @@ defmodule Hologram.Compiler do
     end
 
     package_json_digest = get_package_json_digest(assets_dir)
-    package_json_digest_path = Path.join(build_dir, "package_json_digest.bin")
 
-    File.write!(package_json_digest_path, package_json_digest)
+    # npm creates no node_modules dir for a package.json with no deps.
+    FileUtils.write_p!(package_json_digest_path, package_json_digest)
   end
 
   @doc """
@@ -1441,22 +1483,24 @@ defmodule Hologram.Compiler do
 
   @doc """
   Installs JavaScript deps if package.json has changed or if the deps haven't been installed yet.
+  The record of the last install is kept in the node_modules dir it filled, like the deps, so every
+  build env reads the one record of the deps they share, and removing node_modules removes it too.
 
-  Benchmarks: https://github.com/bartblast/hologram/blob/master/benchmarks/compiler/maybe_install_js_deps_2/README.md
+  Benchmarks: https://github.com/bartblast/hologram/blob/master/benchmarks/elixir/compiler/maybe_install_js_deps_1/README.md
   """
-  @spec maybe_install_js_deps(T.file_path(), T.file_path()) :: :ok | nil
-  def maybe_install_js_deps(assets_dir, build_dir) do
-    package_json_digest_path = Path.join(build_dir, "package_json_digest.bin")
+  @spec maybe_install_js_deps(T.file_path()) :: :ok | nil
+  def maybe_install_js_deps(assets_dir) do
+    package_json_digest_path = package_json_digest_path(assets_dir)
     package_json_lock_path = Path.join(assets_dir, "package-lock.json")
 
     if !File.exists?(package_json_digest_path) or !File.exists?(package_json_lock_path) do
-      install_js_deps(assets_dir, build_dir)
+      install_js_deps(assets_dir)
     else
       old_package_json_digest = File.read!(package_json_digest_path)
       new_package_json_digest = get_package_json_digest(assets_dir)
 
       if new_package_json_digest != old_package_json_digest do
-        install_js_deps(assets_dir, build_dir)
+        install_js_deps(assets_dir)
       end
     end
   end
@@ -1491,15 +1535,30 @@ defmodule Hologram.Compiler do
   end
 
   @doc """
+  Returns what tells the module info dump at the given path from another one: its mtime in posix
+  seconds and the token `dump_module_info_plt/2` wrote with it, or nil when there is no dump. Each
+  dump gets a new random token, so another compile's dump written within the same second has
+  another stamp. The token is nil when there is none, as in a build dir only an older Hologram
+  wrote to. An older Hologram that rewrites the dump leaves the token there, and the mtime alone
+  tells its dump apart then.
+  """
+  @spec module_info_dump_stamp(T.file_path()) :: {non_neg_integer, String.t() | nil} | nil
+  def module_info_dump_stamp(dump_path) do
+    case File.stat(dump_path, time: :posix) do
+      {:ok, %File.Stat{mtime: mtime}} -> {mtime, read_module_info_dump_token(dump_path)}
+      {:error, _reason} -> nil
+    end
+  end
+
+  @doc """
   Splits the given pages into the ones a compile must rebuild and the ones whose bundle it can reuse.
 
   A page is rebuilt when the pages PLT holds no state for it (a new page, or the first compile in a
   VM), when the modules of its kept MFAs meet `reaching_modules` (see
   `Hologram.Compiler.CallGraph.list_modules_reaching/2`: every way a page's bundle depends on a
   module is a path in the call graph from a vertex of the page, or of a component it renders, to that
-  module), when the bundle its kept state describes or that bundle's source map is no longer on disk
-  (a build dir can lose bundles to another build env sharing the static dir), or when that bundle
-  belongs to a static dir other than the given one. A page whose bundle's recorded inputs no longer
+  module), when the bundle its kept state describes, its gzip copy or its source map is no longer on
+  disk, or when that bundle belongs to a static dir other than the given one. A page whose bundle's recorded inputs no longer
   match `js_fingerprints`, the fingerprints of the files now, is rebuilt as well (see
   `js_inputs_changed?/2`): no beam moves when a JavaScript file a bundle inlines is edited. A page
   in `pending_pages` is rebuilt too: an earlier compile set out to build it and did not, so its kept
@@ -1614,15 +1673,17 @@ defmodule Hologram.Compiler do
   digest did not is changed, but no edit).
 
   A module the compiler reported since the last compile (`compiled_modules`, see
-  `Hologram.Compiler.Tracer.take/1`) is read, whatever its entry says. The entry of any other module
-  is left where it is, unless it is a protocol's, whose consolidated beam a new implementation
-  rewrites without a compile, or there is none; that one is checked against the entry's mtime and
-  size, as in `build_module_info_plt!/3`, with `dumped_at` the mtime of the dump the last compile
-  wrote. A module of `editable_modules` that is not among `editable_beams` now is looked up as
+  `Hologram.Compiler.Tracer.take/1`) is read, whatever its entry says. Any other beam is checked
+  against its entry's mtime and size, as in `build_module_info_plt!/3`, with `dumped_at` the mtime of
+  the module info dump on disk when the last compile finished, and read when they moved or when the
+  beam is not older than that dump by a second: another OS process compiling the project, or a new
+  implementation rewriting a consolidated protocol, changes a beam with no compile in this VM. A
+  module of `editable_modules` that is not among `editable_beams` now is looked up as
   `build_module_info_plt!/3` looks up every module, and loses its entry only when the VM has no beam
   for it: a deleted module is purged, while a consolidated protocol whose directory is off the code
   path for a moment (Phoenix's reloader takes it off while it recompiles) keeps its entry. Leaving
-  the entries a scan into a new PLT would copy is what makes a compile that changed nothing cheap.
+  the entries a scan into a new PLT would copy is what makes a compile that changed nothing cheap: a
+  stat per beam, no read.
   """
   @spec patch_module_info_plt!(
           PLT.t(),
@@ -1749,14 +1810,18 @@ defmodule Hologram.Compiler do
 
   @doc """
   Whether the bundle the given bundle info describes can still be served from the given static dir:
-  it was written there, and both the bundle and its source map are on disk. A build dir can lose
-  bundles to another build env sharing the static dir, and the info names one static dir, so reusing
-  it for another would put a digest into that dir's page digest PLT whose file lives elsewhere.
+  it was written there, and the bundle, its gzip copy and its source map are all on disk. The info
+  names one static dir, so reusing it for another, like the one the bundles moved to from the app's
+  static dir, would put a digest into that dir's page digest PLT whose file lives elsewhere.
   """
   @spec usable_bundle?(map, T.file_path()) :: boolean
   def usable_bundle?(bundle_info, static_dir) do
-    Path.dirname(bundle_info.static_bundle_path) == static_dir and
-      File.exists?(bundle_info.static_bundle_path) and
+    bundle_path = bundle_info.static_bundle_path
+    gzip_path = gzip_path(bundle_path)
+
+    Path.dirname(bundle_path) == static_dir and
+      File.exists?(bundle_path) and
+      File.exists?(gzip_path) and
       File.exists?(bundle_info.static_source_map_path)
   end
 
@@ -2482,38 +2547,53 @@ defmodule Hologram.Compiler do
   end
 
   # Moves the bundle with the given file name and its source map from the output dir esbuild wrote
-  # them to into the static dir, and returns the paths of both there.
+  # them to into the static dir, and returns the paths of both there. The bundle's gzip copy is
+  # written in the output dir and moved first, so that a served copy is never half written and a
+  # served bundle always has one.
   defp move_bundle_to_static_dir(output_dir, bundle_file_name, opts) do
     output_bundle_path = Path.join(output_dir, bundle_file_name)
+    output_gzip_path = gzip_path(output_bundle_path)
     static_bundle_path = Path.join(opts[:static_dir], bundle_file_name)
     static_source_map_path = static_bundle_path <> ".map"
 
+    gzipped_bundle =
+      output_bundle_path
+      |> File.read!()
+      |> :zlib.gzip()
+
+    File.write!(output_gzip_path, gzipped_bundle)
+
+    File.rename!(output_gzip_path, gzip_path(static_bundle_path))
     File.rename!(output_bundle_path, static_bundle_path)
     File.rename!(output_bundle_path <> ".map", static_source_map_path)
 
     {static_bundle_path, static_source_map_path}
   end
 
-  # A compiled module is read. The entry of any other module is left as it is, unless it is a
-  # protocol's, whose consolidated beam a new implementation rewrites without a compile; that one,
-  # and a beam with no entry, is checked against its mtime and size first.
+  # The file holding the token of the module info dump at the given path (see
+  # dump_module_info_plt/2).
+  defp module_info_dump_token_path(dump_path), do: dump_path <> ".token"
+
+  # The record of the last JS deps install, in the node_modules dir it filled. npm leaves files it
+  # doesn't know there alone, on a reinstall and on an install after package.json changed.
+  defp package_json_digest_path(assets_dir) do
+    Path.join([assets_dir, "node_modules", ".package_json_digest.bin"])
+  end
+
+  # A compiled module is read. Any other beam is checked against its entry's mtime and size first:
+  # another OS process can rewrite it, as a new implementation rewrites a consolidated protocol's,
+  # with no compile this VM's tracer sees.
   defp patch_module_info_plt_entry!(plt, module, beam_path, dumped_at, compiled_modules) do
     old_info = get_module_info(plt, module)
 
-    cond do
-      MapSet.member?(compiled_modules, module) ->
-        put_compared_module_info(plt, module, old_info, Reflection.beam_info(beam_path))
+    new_info =
+      if MapSet.member?(compiled_modules, module) do
+        Reflection.beam_info(beam_path)
+      else
+        reusable_module_info(module, beam_path, plt, dumped_at) || Reflection.beam_info(beam_path)
+      end
 
-      match?(%{protocol?: false}, old_info) ->
-        :kept
-
-      true ->
-        new_info =
-          reusable_module_info(module, beam_path, plt, dumped_at) ||
-            Reflection.beam_info(beam_path)
-
-        put_compared_module_info(plt, module, old_info, new_info)
-    end
+    put_compared_module_info(plt, module, old_info, new_info)
   end
 
   # A module that left the listing without its beam being deleted, as the full scan would see it. A
@@ -2598,11 +2678,21 @@ defmodule Hologram.Compiler do
     if info, do: PLT.put(new_plt, module, info)
   end
 
-  # Not reusable: read it.
+  # Read unless reusable. A path the VM still names for a loaded module whose file another OS
+  # process deleted has nothing to read, so the module gets no entry, as a deleted one. Checked only
+  # when the entry is not reused, whose check of the beam found no file then.
   defp put_module_info_plt_entry!(new_plt, module, beam_source, old_plt, dumped_at) do
     info =
-      reusable_module_info(module, beam_source, old_plt, dumped_at) ||
-        Reflection.beam_info(beam_source)
+      cond do
+        reused_info = reusable_module_info(module, beam_source, old_plt, dumped_at) ->
+          reused_info
+
+        is_binary(beam_source) or File.regular?(beam_source) ->
+          Reflection.beam_info(beam_source)
+
+        true ->
+          nil
+      end
 
     put_module_info(new_plt, module, info)
   end
@@ -2612,6 +2702,16 @@ defmodule Hologram.Compiler do
     metafile_path
     |> File.read!()
     |> JSON.decode!()
+  end
+
+  # nil when the dump has no token: an older Hologram wrote it.
+  defp read_module_info_dump_token(dump_path) do
+    case dump_path
+         |> module_info_dump_token_path()
+         |> File.read() do
+      {:ok, token} -> token
+      {:error, _reason} -> nil
+    end
   end
 
   # The kept pages whose MFAs moved, and the ones whose MFAs are unchanged, with their states. A

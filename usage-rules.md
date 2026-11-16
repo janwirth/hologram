@@ -33,6 +33,7 @@ For additional details beyond these rules, see deps/hologram/llms-full.txt or ht
 
 - Hologram templates use the `~HOLO` sigil, not HEEx. **Never** use HEEx syntax (`<%= %>`, `<.component>`, `<:slot>`).
 - Access props and state with `@var` syntax: `{@name}`, `{@count}`.
+- Reading a var the template doesn't have raises `Hologram.MisuseError`, naming the var and the vars the template has. A declared prop with no default is a var only when the usage passes it, so give it a default if the template reads it.
 - Interpolate Elixir expressions with curly braces: `{expression}`. **Not** `<%= expression %>`.
 - Component nodes use module names: `<MyComponent prop="value" />`. **Not** `<.my_component>`.
 - Tag names can be dynamic: `<{@module} cid="my_id" title="Hello" />` renders a component when the expression yields a component module, `<{@tag} class="heading">` renders an HTML element when it yields a string, anything else raises `ArgumentError`.
@@ -264,7 +265,7 @@ For additional details beyond these rules, see deps/hologram/llms-full.txt or ht
 
 ## Umbrella Projects
 
-- Only the child app that owns the Phoenix endpoint gets the compiler entry (`compilers: Mix.compilers() ++ [:hologram]`). It also takes the `:hologram` dep, the `Hologram.Router` plug, the `"hologram"` static path and the `/priv/static/hologram/` gitignore entry.
+- Only the child app that owns the Phoenix endpoint gets the compiler entry (`compilers: Mix.compilers() ++ [:hologram]`). It also takes the `:hologram` dep and the `Hologram.Router` plug.
 - Child apps that only define pages and components take the `:hologram` dep alone. **Never** add the compiler entry to them - their pages are discovered and bundled when the endpoint app compiles.
 - Endpoint configuration lives in the umbrella root `config` directory, not in the child app.
 - Run `mix holo` from the umbrella root. Started from inside the endpoint app it watches only that app's sources, so changes in sibling apps do not trigger a live reload.

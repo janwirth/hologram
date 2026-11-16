@@ -191,6 +191,17 @@ export default class Hologram {
   static #scrollPosition = null;
   static #shouldLoadMountData = true;
 
+  // Numbers the snapshots saved, in the order they were made (see #writePageSnapshot).
+  static #snapshotSaveCount = 0;
+
+  // For each history entry whose snapshot is on its way to OPFS, the write in flight. The entry's
+  // next write waits for it (see #savePageSnapshot).
+  static #snapshotWrites = new Map();
+
+  // For each history entry whose copy in session storage a save on beforeunload wrote, that save's
+  // number (see #writePageSnapshot).
+  static #unloadSnapshotSaves = new Map();
+
   // Made public to make tests easier
   //
   // Asks the server who is logged in now, and loads the page afresh when that is another identity
@@ -593,19 +604,46 @@ export default class Hologram {
 
   // Made public to make tests easier
   //
+  // Whether the browser loaded this document by going back or forward to its history entry. The
+  // answer describes how the document was loaded, not the navigations within it, which the
+  // History API makes without the browser recording a new type, so it means something only while
+  // the document starts. A browser that keeps no record of it answers no.
+  static isBackForwardLoad() {
+    const entry =
+      "getEntriesByType" in performance
+        ? performance.getEntriesByType("navigation")[0]
+        : undefined;
+
+    if (entry !== undefined) {
+      return entry.type === "back_forward";
+    }
+
+    // Older browsers record it only through the deprecated API.
+    return (
+      performance.navigation !== undefined &&
+      performance.navigation.type === PerformanceNavigation.TYPE_BACK_FORWARD
+    );
+  }
+
+  // Made public to make tests easier
+  //
   // Whether the snapshot of the history entry a new document is loaded for can be restored into
-  // it: only for Back and Forward, not for a reload; only for the identity the server has just
-  // rendered the document for, since a snapshot taken for another can hold another user's state;
-  // and only into the code it was taken with, as a snapshot that does not fit mounts from the
-  // state the server has just rendered instead.
+  // it: only when the document was loaded by Back or Forward; only for the identity the server
+  // has just rendered the document for, since a snapshot taken for another can hold another
+  // user's state; and only into the code it was taken with, as a snapshot that does not fit
+  // mounts from the state the server has just rendered instead.
+  //
+  // Any other load that finds the entry's id renders what the server has just sent: a reload, or
+  // a link or location.assign() to the URL the tab already shows, which Chrome makes a load of the
+  // same entry with its state kept.
   //
   // A snapshot with no identity tag is passed over too: it was taken before snapshots were tagged,
   // or after the identity changed under its page, and can hold anyone's state. So the first Back
   // past a reload or an external site after an upgrade renders the page fresh, once.
-  static isDocumentSnapshotRestorable(pageSnapshot, isPageReload) {
+  static isDocumentSnapshotRestorable(pageSnapshot, isBackForwardLoad) {
     return (
       pageSnapshot !== null &&
-      !isPageReload &&
+      isBackForwardLoad &&
       IdentityTracker.isCurrentTag(pageSnapshot.identityTag) &&
       LiveReload.snapshotFits(
         pageSnapshot,
@@ -792,6 +830,10 @@ export default class Hologram {
       // server sent, so the old side is built by mirroring this render onto it. The patch then
       // adopts those nodes instead of recreating the whole page.
       if (Hologram.virtualDocument === null) {
+        // Phoenix's live reload iframe is taken out before the mirror reads the page (see
+        // LiveReload.removePhoenixReloader()).
+        LiveReload.removePhoenixReloader();
+
         Hologram.virtualDocument = Vdom.mirror(
           newVirtualDocument,
           document.documentElement,
@@ -1505,45 +1547,63 @@ export default class Hologram {
       return $.#pageSnapshots.get(snapshotKey);
     }
 
-    // Try OPFS second
+    // Session storage second. A copy there is written on beforeunload, or when a write to OPFS
+    // fails, both times with the page as it is then, and the next write to OPFS that succeeds
+    // removes it. So it is never older than the one in OPFS, unless the document died between a
+    // write to OPFS and the removal that follows it. An entry left through a client-side
+    // navigation and later by a full page load has both, and the one in OPFS is the older.
+    let serializedSnapshot = null;
+
+    // A browser that denies the page storage access throws on any use of session storage. The
+    // copy in OPFS is then tried.
+    try {
+      serializedSnapshot = sessionStorage.getItem(snapshotKey);
+    } catch (error) {
+      console.error(
+        "Failed to read page snapshot from session storage:",
+        error,
+      );
+    }
+
+    if (serializedSnapshot) {
+      let deserializedSnapshot;
+
+      // A stored snapshot that can't be read back counts as none, rather than Back failing for
+      // good: the entry's page is then loaded afresh. The copy in OPFS is not tried, as it is the
+      // older one.
+      try {
+        deserializedSnapshot = Deserializer.deserialize(serializedSnapshot);
+      } catch (error) {
+        console.error(
+          "Failed to restore page snapshot from session storage:",
+          error,
+        );
+
+        return null;
+      }
+
+      // Cache the deserialized snapshot in memory for faster subsequent access
+      $.#pageSnapshots.set(snapshotKey, deserializedSnapshot);
+
+      return deserializedSnapshot;
+    }
+
+    // OPFS last. A copy there that can't be read back counts as none too.
     try {
       const root = await navigator.storage.getDirectory();
       const fileHandle = await root.getFileHandle(snapshotKey, {create: false});
       const file = await fileHandle.getFile();
-      const serializedSnapshot = await file.text();
-      const deserializedSnapshot = Deserializer.deserialize(serializedSnapshot);
+      const serializedOpfsSnapshot = await file.text();
+
+      const deserializedSnapshot = Deserializer.deserialize(
+        serializedOpfsSnapshot,
+      );
 
       // Cache the deserialized snapshot in memory for faster subsequent access
       $.#pageSnapshots.set(snapshotKey, deserializedSnapshot);
 
       return deserializedSnapshot;
     } catch {
-      // Fall back to session storage if OPFS fails
-      const serializedSnapshot = sessionStorage.getItem(snapshotKey);
-
-      if (serializedSnapshot) {
-        let deserializedSnapshot;
-
-        // A stored snapshot that can't be read back counts as none, as an OPFS copy that can't be
-        // read is passed over above: the entry's page is then loaded afresh, rather than Back
-        // failing for good.
-        try {
-          deserializedSnapshot = Deserializer.deserialize(serializedSnapshot);
-        } catch (error) {
-          console.error(
-            "Failed to restore page snapshot from session storage:",
-            error,
-          );
-
-          return null;
-        }
-
-        // Cache the deserialized snapshot in memory for faster subsequent access
-        $.#pageSnapshots.set(snapshotKey, deserializedSnapshot);
-
-        return deserializedSnapshot;
-      }
-
       return null;
     }
   }
@@ -1554,6 +1614,15 @@ export default class Hologram {
       Type.atom("to"),
       Erlang_Maps["get/2"](Type.atom("params"), operation),
     );
+  }
+
+  // Made public to make tests easier
+  //
+  // Saves the page to session storage, which is written synchronously: a write to OPFS is async
+  // and may not finish before the document goes away.
+  static handleBeforeunloadEvent() {
+    $.#savePageSnapshot(true);
+    $.saveEts();
   }
 
   // Made public to make tests easier
@@ -1784,19 +1853,18 @@ export default class Hologram {
       $.handleUncaughtError(event.reason);
     });
 
-    window.addEventListener("beforeunload", () => {
-      // Force synchronous session storage save since async OPFS may not complete before page termination
-      Hologram.#savePageSnapshot(true);
-
-      Hologram.saveEts();
-    });
+    window.addEventListener("beforeunload", Hologram.handleBeforeunloadEvent);
 
     window.addEventListener("popstate", Hologram.handlePopstateEvent);
+
+    // The page is being left, for good or into the browser's back/forward cache.
+    window.addEventListener("pagehide", () => Sse.suspend());
 
     window.addEventListener("pageshow", (event) => {
       // A page the browser brings back from its back/forward cache.
       if (event.persisted) {
         Hologram.checkIdentity();
+        Sse.resume();
       }
 
       // Reconnect when page is restored from bfcache OR when navigating back from external page
@@ -1829,12 +1897,14 @@ export default class Hologram {
     // document was loaded for, under that URL.
     $.pagePath = window.location.pathname;
 
-    // Check if there's already a history state (e.g., when navigating back from external page)
+    // The entry carries an id when the tab has been on it before: gone back or forward to,
+    // reloaded, or, in Chrome, loaded again under the same URL. Its snapshot is restored only for
+    // Back and Forward (see isDocumentSnapshotRestorable).
     if (history.state) {
       $.historyId = history.state;
       const pageSnapshot = await $.#getPageSnapshot(history.state);
 
-      if ($.isDocumentSnapshotRestorable(pageSnapshot, $.#isPageReload())) {
+      if ($.isDocumentSnapshotRestorable(pageSnapshot, $.isBackForwardLoad())) {
         $.#documentSnapshot = pageSnapshot;
       }
     } else {
@@ -1904,27 +1974,6 @@ export default class Hologram {
 
   static #isPageModuleRegistered(pageModule) {
     return $.#registeredPageModules.has(pageModule.value);
-  }
-
-  // Note: Although using the History API makes it impossible to use the Performance API for detecting
-  // what was the last navigation type, when the page is reloaded the navigation type will
-  // always be "reload". But the type remains the same for succeeding navigation types within
-  // Hologram navigation, hence the additional check for whether the app was already initiated.
-  // In case of the new Performance API, there will always be only one entry due to History API use.
-  static #isPageReload() {
-    // New Performance API
-    if ("getEntriesByType" in performance) {
-      return (
-        !$.#isInitiated &&
-        performance.getEntriesByType("navigation")[0].type === "reload"
-      );
-    }
-
-    // Old Performance API
-    return (
-      !$.#isInitiated &&
-      performance.navigation.type === PerformanceNavigation.TYPE_RELOAD
-    );
   }
 
   static #isPrefetchPageTimedOut(mapKey) {
@@ -2223,9 +2272,7 @@ export default class Hologram {
       // SSE must open AFTER `#mountPage()` because the handshake payload
       // includes the receipts merged from `pageMountData.subReceiptAdds` -
       // connecting earlier would send an empty receipts list.
-      if (Sse.eventSource === null) {
-        Sse.connect();
-      }
+      Sse.start();
     });
   }
 
@@ -2656,9 +2703,12 @@ export default class Hologram {
   }
 
   static async #savePageSnapshot(forceSync = false) {
-    // The entry's snapshot is still waiting to be restored, and nothing has taken its place: the
-    // page is not mounted yet, so there is no state to save over it.
-    if ($.#documentSnapshot !== null) {
+    const pageModule = $.pageModule();
+
+    // The document has neither mounted a page nor restored one yet, while it starts and while the
+    // entry's snapshot waits to be restored. There is no state to save, and a save would put one
+    // with no page over the entry's snapshot.
+    if (pageModule === null) {
       return;
     }
 
@@ -2675,8 +2725,8 @@ export default class Hologram {
       identityPeriod: $.pageIdentityPeriod,
       identityTag: IdentityTracker.tagFor($.pageIdentityPeriod),
       instanceId: App.instanceId,
-      pageDigest: LiveReload.heldPageDigest(Hologram.#pageModule),
-      pageModule: Hologram.#pageModule,
+      pageDigest: LiveReload.heldPageDigest(pageModule),
+      pageModule: pageModule,
       pageParams: Hologram.#pageParams,
       runtimeDigest: $.#runtimeDigest(),
       scrollPosition: [window.scrollX, window.scrollY],
@@ -2686,6 +2736,7 @@ export default class Hologram {
     };
 
     const snapshotKey = $.#pageSnapshotKey($.historyId);
+    const saveNumber = ++$.#snapshotSaveCount;
 
     // Always save deserialized object to in-memory cache first (fastest)
     $.#pageSnapshots.set(snapshotKey, pageSnapshot);
@@ -2696,6 +2747,7 @@ export default class Hologram {
     if (forceSync) {
       try {
         sessionStorage.setItem(snapshotKey, serializedPageSnapshot);
+        $.#unloadSnapshotSaves.set(snapshotKey, saveNumber);
       } catch (error) {
         console.error(
           "Failed to save page snapshot to session storage:",
@@ -2706,7 +2758,38 @@ export default class Hologram {
       return;
     }
 
-    // For normal navigation: OPFS primary, session storage fallback
+    // One write to OPFS of an entry at a time, in the order the saves were made. Saves of an entry
+    // can overlap, since its id stays the history id until the next page is shown, and two writes
+    // at once can land in either order, so the earlier state could land last.
+    const previousWrite =
+      $.#snapshotWrites.get(snapshotKey) ?? Promise.resolve();
+
+    const write = previousWrite.then(() =>
+      $.#writePageSnapshot(snapshotKey, serializedPageSnapshot, saveNumber),
+    );
+
+    $.#snapshotWrites.set(snapshotKey, write);
+
+    await write;
+
+    if ($.#snapshotWrites.get(snapshotKey) === write) {
+      $.#snapshotWrites.delete(snapshotKey);
+    }
+  }
+
+  // Writes a snapshot to OPFS, with session storage as the fallback. Never rejects, since the
+  // entry's next write waits for it.
+  static async #writePageSnapshot(
+    snapshotKey,
+    serializedPageSnapshot,
+    saveNumber,
+  ) {
+    // A save on beforeunload made after this one has put the newer copy in session storage, which
+    // stays. The document can live on past beforeunload, when the unload is cancelled or the link
+    // was a download, and this write then still finishes.
+    const isSessionCopyNewer = () =>
+      ($.#unloadSnapshotSaves.get(snapshotKey) ?? 0) > saveNumber;
+
     try {
       const root = await navigator.storage.getDirectory();
       const fileHandle = await root.getFileHandle(snapshotKey, {create: true});
@@ -2714,8 +2797,11 @@ export default class Hologram {
       await writable.write(serializedPageSnapshot);
       await writable.close();
 
-      // Successfully saved to OPFS, clear session storage fallback if it exists
-      sessionStorage.removeItem(snapshotKey);
+      // Saved to OPFS, so an older copy in session storage goes
+      if (!isSessionCopyNewer()) {
+        sessionStorage.removeItem(snapshotKey);
+        $.#unloadSnapshotSaves.delete(snapshotKey);
+      }
     } catch (opfsError) {
       // Firefox throws SecurityError when the site may not store data (private window,
       // site data blocked): session storage keeps the data, so there is nothing to report.
@@ -2723,9 +2809,14 @@ export default class Hologram {
         console.error("Failed to save page snapshot to OPFS:", opfsError);
       }
 
+      if (isSessionCopyNewer()) {
+        return;
+      }
+
       // Fallback to session storage if OPFS fails
       try {
         sessionStorage.setItem(snapshotKey, serializedPageSnapshot);
+        $.#unloadSnapshotSaves.delete(snapshotKey);
       } catch (sessionStorageError) {
         console.error(
           "Failed to save page snapshot to session storage:",

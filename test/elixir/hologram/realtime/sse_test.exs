@@ -14,6 +14,7 @@ defmodule Hologram.Realtime.SSETest do
   alias Hologram.Realtime.SubscriptionRegistry
   alias Hologram.Test.Fixtures.Realtime.SSE.Module1
 
+  use_module_stub :asset_path_registry
   use_module_stub :chunk_registry
 
   setup :set_mox_global
@@ -261,6 +262,15 @@ defmodule Hologram.Realtime.SSETest do
   describe "encode_compiled_envelope/1" do
     test "wraps the id in a compiled SSE event envelope with no data" do
       assert encode_compiled_envelope(42) == "event: compiled\nid: 42\ndata:\n\n"
+    end
+  end
+
+  describe "encode_css_changed_envelope/2" do
+    test "wraps the id and the app's asset paths as JSON in a css_changed SSE event envelope" do
+      app_asset_paths = %{"assets/app.css" => "/assets/app-abc.css"}
+
+      assert encode_css_changed_envelope(42, app_asset_paths) ==
+               ~s(event: css_changed\nid: 42\ndata: {"assets/app.css":"/assets/app-abc.css"}\n\n)
     end
   end
 
@@ -826,6 +836,27 @@ defmodule Hologram.Realtime.SSETest do
       {:cont, updated_conn} = process_message(conn, nil, nil)
 
       assert updated_conn.resp_body =~ ~r/\Aevent: compiled\nid: \d+\ndata:\n\n\z/
+    end
+  end
+
+  describe "process_message/4 on :css_changed" do
+    setup do
+      setup_asset_path_registry(AssetPathRegistryStub)
+    end
+
+    test "pushes a css_changed SSE event with the app's asset paths, leaving out Hologram's bundles",
+         %{mapping: mapping} do
+      conn = prepared_test_conn()
+      send(self(), :css_changed)
+
+      {:cont, updated_conn} = process_message(conn, nil, nil)
+
+      app_asset_paths = Map.drop(mapping, ["hologram/runtime.js"])
+
+      envelope_regex = ~r/\Aevent: css_changed\nid: \d+\ndata: (.+)\n\n\z/
+      assert [_chunk, data] = Regex.run(envelope_regex, updated_conn.resp_body)
+
+      assert JSON.decode!(data) == app_asset_paths
     end
   end
 
@@ -1780,6 +1811,19 @@ defmodule Hologram.Realtime.SSETest do
       on_exit(fn -> Process.exit(pid, :kill) end)
 
       assert_receive {:"$gen_cast", {:replay_outcome, ^pid}}
+      assert live_reload_subscriber?(pid)
+    end
+
+    test "asks live reload for an asset change its tab missed once listening" do
+      # Stands in for live reload, which does not run in the test env.
+      Process.register(self(), LiveReload)
+
+      conn = Plug.Conn.fetch_query_params(conn_with_instance_id())
+      instance_id = conn.query_params["instance_id"]
+      pid = spawn(fn -> stream(conn) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      assert_receive {:"$gen_cast", {:replay_asset_change, ^pid, ^instance_id}}
       assert live_reload_subscriber?(pid)
     end
   end

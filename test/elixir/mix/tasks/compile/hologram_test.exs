@@ -19,6 +19,7 @@ defmodule Mix.Tasks.Compile.HologramTest do
   alias Hologram.Test.Fixtures.Mix.Tasks.Compile.Hologram.Module3
   alias Hologram.Test.Fixtures.Mix.Tasks.Compile.Hologram.Module5
   alias Hologram.Test.Fixtures.Mix.Tasks.Compile.Hologram.Module7
+  alias Hologram.Test.Fixtures.Mix.Tasks.Compile.Hologram.Module8
 
   # The module is most of the lib suite's serial phase, so CI runs it in a job of its own (see the
   # lib_tests matrix in .github/workflows/ci.yml).
@@ -38,6 +39,7 @@ defmodule Mix.Tasks.Compile.HologramTest do
   @assets_dir Path.join(@test_dir, "assets")
   @build_dir Path.join(@test_dir, "build")
   @build_lib_dir Path.join(@test_dir, "build_lib")
+  @legacy_bundles_dir Path.join([@test_dir, "app_static", "hologram"])
   @snapshot_build_dir Path.join(@test_dir, "snapshot_build")
   @snapshot_static_dir Path.join(@test_dir, "snapshot_static")
   @static_dir Path.join(@test_dir, "static")
@@ -46,6 +48,7 @@ defmodule Mix.Tasks.Compile.HologramTest do
   @compile_inputs_path Path.join(@build_dir, Reflection.compile_inputs_dump_file_name())
   @compiler_lock_file_name Reflection.compiler_lock_file_name()
   @lock_path Path.join(@build_dir, @compiler_lock_file_name)
+  @install_lock_path Path.join(@assets_dir, Reflection.js_deps_install_lock_file_name())
 
   # The Elixir compile manifest of the :hologram app, the one app with a manifest in the test
   # build lib dir.
@@ -231,7 +234,7 @@ defmodule Mix.Tasks.Compile.HologramTest do
     edited_info = %{info | digest: "edited", mtime: info.mtime - 100}
 
     plt = PLT.start(items: Map.to_list(%{module_infos | module => edited_info}))
-    PLT.dump(plt, dump_path)
+    Compiler.dump_module_info_plt(plt, dump_path)
     PLT.stop(plt)
   end
 
@@ -286,6 +289,35 @@ defmodule Mix.Tasks.Compile.HologramTest do
     |> load_plt_items()
   end
 
+  # Loads other code for the module than its beam holds, as a VM still runs once another OS process
+  # rewrote the beam. The beam's code is loaded back when the test exits.
+  defp load_code_other_than_beam(module) do
+    beam_path = :code.which(module)
+    ignore_module_conflict? = Code.get_compiler_option(:ignore_module_conflict)
+    Code.put_compiler_option(:ignore_module_conflict, true)
+
+    [{^module, bytecode}] =
+      try do
+        # Under the module's own file name, which its compile info names.
+        Code.compile_string(
+          "defmodule #{inspect(module)} do def value, do: :memory end",
+          Reflection.source_path(module)
+        )
+      after
+        Code.put_compiler_option(:ignore_module_conflict, ignore_module_conflict?)
+      end
+
+    on_exit(fn -> reload_beam(module) end)
+
+    # This VM compiled it, which the tracer records, but the code stands for what the beam held
+    # before the other process rewrote it.
+    :ets.delete(Tracer, module)
+
+    # Loaded from the beam's path, as Mix loads a module, so that the VM compares it with the beam.
+    :code.purge(module)
+    {:module, ^module} = :code.load_binary(module, beam_path, bytecode)
+  end
+
   defp load_compile_state_dump(opts) do
     dump_path = Path.join(opts[:build_dir], Reflection.compile_state_dump_file_name())
     assert File.exists?(dump_path)
@@ -320,6 +352,28 @@ defmodule Mix.Tasks.Compile.HologramTest do
     items
   end
 
+  # Moves a bundle's files, its gzip copy included, to the given path of an older build, and returns
+  # the bundle info naming them under the given digest.
+  defp move_bundle_files(bundle_info, old_digest, old_bundle_path) do
+    old_gzip_path = Compiler.gzip_path(old_bundle_path)
+    old_source_map_path = old_bundle_path <> ".map"
+
+    File.rename!(bundle_info.static_bundle_path, old_bundle_path)
+
+    bundle_info.static_bundle_path
+    |> Compiler.gzip_path()
+    |> File.rename!(old_gzip_path)
+
+    File.rename!(bundle_info.static_source_map_path, old_source_map_path)
+
+    %{
+      bundle_info
+      | digest: old_digest,
+        static_bundle_path: old_bundle_path,
+        static_source_map_path: old_source_map_path
+    }
+  end
+
   # How many chunk bundles the last compile left.
   defp num_chunk_bundles do
     map_size(cache_state().chunks.bundle_infos)
@@ -333,18 +387,8 @@ defmodule Mix.Tasks.Compile.HologramTest do
     [signature] = signatures_carrying(chunks, @chunk_only_impl)
     bundle_info = chunks.bundle_infos[signature]
 
-    old_digest = "OLDCHUNK"
-    old_bundle_path = Path.join(opts[:static_dir], "chunk-#{old_digest}.js")
-    old_source_map_path = old_bundle_path <> ".map"
-    File.rename!(bundle_info.static_bundle_path, old_bundle_path)
-    File.rename!(bundle_info.static_source_map_path, old_source_map_path)
-
-    old_bundle_info = %{
-      bundle_info
-      | digest: old_digest,
-        static_bundle_path: old_bundle_path,
-        static_source_map_path: old_source_map_path
-    }
+    old_bundle_path = Path.join(opts[:static_dir], "chunk-OLDCHUNK.js")
+    old_bundle_info = move_bundle_files(bundle_info, "OLDCHUNK", old_bundle_path)
 
     Cache.put_chunks(%{
       chunks
@@ -370,7 +414,21 @@ defmodule Mix.Tasks.Compile.HologramTest do
     |> PLT.reset()
     |> PLT.put(Map.to_list(module_infos))
 
-    Cache.put_module_infos(dumped_at, editable_modules)
+    # The dump this VM saw, whose token the cache keeps beside the dump time.
+    %{dump_token: dump_token} = Cache.get()
+    Cache.put_module_infos(dumped_at && {dumped_at, dump_token}, editable_modules)
+  end
+
+  # Moves the kept runtime bundle, its gzip copy and its source map to the names of an older build,
+  # and has the kept runtime state name them, as if an earlier compile had built that runtime.
+  defp put_kept_runtime_bundle_under_old_digest(opts) do
+    runtime = cache_state().runtime
+    old_bundle_path = Path.join(opts[:static_dir], "runtime-OLDRUNTM.js")
+    old_bundle_info = move_bundle_files(runtime.bundle_info, "OLDRUNTM", old_bundle_path)
+
+    Cache.put_runtime(%{runtime | bundle_info: old_bundle_info})
+
+    old_bundle_info
   end
 
   # Makes the first kept pages by name pending, so that a run rebuilds them with no edit, and
@@ -399,6 +457,102 @@ defmodule Mix.Tasks.Compile.HologramTest do
     recorded = fn -> Agent.get(agent, &Enum.reverse/1) end
 
     {record, recorded}
+  end
+
+  defp reload_beam(module) do
+    :code.purge(module)
+    :code.delete(module)
+    :code.purge(module)
+    {:module, ^module} = :code.load_file(module)
+  end
+
+  # Deletes the module's beam as another OS process does when its source file goes, the module
+  # staying loaded. The beam and its code are put back when the test exits.
+  defp remove_beam(module) do
+    Code.ensure_loaded!(module)
+    beam_path = :code.which(module)
+    bytecode = File.read!(beam_path)
+    %File.Stat{mtime: mtime} = File.stat!(beam_path, time: :posix)
+
+    on_exit(fn ->
+      File.write!(beam_path, bytecode)
+      File.touch!(beam_path, mtime)
+      reload_beam(module)
+    end)
+
+    File.rm!(beam_path)
+  end
+
+  # Writes the module info dump again with the given change to its entries, as another OS process's
+  # compile does, with an mtime the given number of seconds past the one it had: 0 for a dump
+  # written in the same second.
+  defp rewrite_module_info_dump(opts, fun, seconds_later \\ 1) do
+    dump_path = Path.join(opts[:build_dir], Reflection.module_info_plt_dump_file_name())
+    %File.Stat{mtime: mtime} = File.stat!(dump_path, time: :posix)
+
+    module_infos =
+      opts
+      |> load_module_info_items()
+      |> fun.()
+
+    plt = PLT.start(items: Map.to_list(module_infos))
+    Compiler.dump_module_info_plt(plt, dump_path)
+    PLT.stop(plt)
+
+    File.touch!(dump_path, mtime + seconds_later)
+  end
+
+  # The calls of the given functions this process made while the function ran, in order, as
+  # {module, function} pairs. Each function is given with the arguments a call must have, or :_ for
+  # any. Collected by another process, since the compile can take messages off this one's mailbox.
+  defp trace_calls(functions, fun) do
+    {:ok, collector} = Agent.start_link(fn -> [] end)
+    {:ok, tracer} = Task.start_link(fn -> collect_traced_calls(collector) end)
+
+    patterns =
+      Enum.map(functions, fn
+        {module, function, :_} -> {{module, function, :_}, true}
+        {module, function, args} -> {{module, function, length(args)}, [{args, [], []}]}
+      end)
+
+    try do
+      Enum.each(patterns, fn {mfa, match_spec} ->
+        :erlang.trace_pattern(mfa, match_spec, [:global])
+      end)
+
+      :erlang.trace(self(), true, [:call, {:tracer, tracer}])
+      fun.()
+    after
+      :erlang.trace(self(), false, [:call])
+
+      Enum.each(patterns, fn {mfa, _match_spec} ->
+        :erlang.trace_pattern(mfa, false, [:global])
+      end)
+    end
+
+    # Every trace message of this process is in the tracer's mailbox once this arrives.
+    ref = :erlang.trace_delivered(self())
+
+    receive do
+      {:trace_delivered, _pid, ^ref} -> :ok
+    end
+
+    send(tracer, {:done, self()})
+
+    receive do
+      :collected -> Agent.get(collector, &Enum.reverse/1)
+    end
+  end
+
+  defp collect_traced_calls(collector) do
+    receive do
+      {:trace, _pid, :call, {module, function, _args}} ->
+        Agent.update(collector, &[{module, function} | &1])
+        collect_traced_calls(collector)
+
+      {:done, caller} ->
+        send(caller, :collected)
+    end
   end
 
   # What the compiler tracer records when the module is compiled: the bytes its beam holds.
@@ -444,21 +598,20 @@ defmodule Mix.Tasks.Compile.HologramTest do
   defp setup_empty_assets_and_build_dirs(opts) do
     assets_dir = Path.join(@test_dir, "assets_empty")
     clean_dir(assets_dir)
+    link_lib_js_deps(assets_dir)
 
     build_dir = setup_empty_build_dir()
-    link_lib_js_deps(assets_dir, build_dir)
 
     opts
     |> Keyword.put(:assets_dir, assets_dir)
     |> Keyword.put(:build_dir, build_dir)
   end
 
-  # A build dir with nothing compiled, holding the record of the lib's JavaScript deps being linked
-  # to the module's assets dir, so that a compile into it installs nothing.
+  # A build dir with nothing compiled. A compile into it installs nothing: the record of the JS deps
+  # install is the assets dir's, which every build dir shares.
   defp setup_empty_build_dir do
     build_dir = Path.join(@test_dir, "build_empty")
     clean_dir(build_dir)
-    link_lib_js_deps(@assets_dir, build_dir)
 
     build_dir
   end
@@ -476,6 +629,25 @@ defmodule Mix.Tasks.Compile.HologramTest do
     |> File.rm()
 
     :ok
+  end
+
+  # Starts an OS process that lives until the calling process exits, which closes its stdin, and
+  # returns its OS-level PID. Both programs read stdin until EOF.
+  defp start_os_process do
+    {executable, args} =
+      case :os.type() do
+        {:win32, _name} -> {"findstr", ["x"]}
+        {:unix, _name} -> {"cat", []}
+      end
+
+    port =
+      executable
+      |> System.find_executable()
+      |> then(&Port.open({:spawn_executable, &1}, [:binary, args: args]))
+
+    {:os_pid, os_pid} = Port.info(port, :os_pid)
+
+    os_pid
   end
 
   defp test_build_artifacts(opts) do
@@ -546,6 +718,12 @@ defmodule Mix.Tasks.Compile.HologramTest do
       |> Path.wildcard()
       |> Enum.sort()
 
+    chunk_gzip_paths =
+      opts[:static_dir]
+      |> Path.join("chunk-????????.js.gz")
+      |> Path.wildcard()
+      |> Enum.sort()
+
     chunk_source_map_paths =
       opts[:static_dir]
       |> Path.join("chunk-????????.js.map")
@@ -558,6 +736,8 @@ defmodule Mix.Tasks.Compile.HologramTest do
              bundle_infos
              |> Enum.map(& &1.static_bundle_path)
              |> Enum.sort()
+
+    assert chunk_gzip_paths == Enum.map(chunk_bundle_paths, &Compiler.gzip_path/1)
 
     assert chunk_source_map_paths ==
              bundle_infos
@@ -595,9 +775,10 @@ defmodule Mix.Tasks.Compile.HologramTest do
     assert File.exists?(opts[:tmp_dir])
   end
 
+  # The bin dir only a real npm install creates, which link_lib_js_deps/1 doesn't.
   defp test_js_deps(opts) do
     assert opts[:assets_dir]
-           |> Path.join("node_modules")
+           |> Path.join("node_modules/.bin")
            |> File.exists?()
   end
 
@@ -629,6 +810,14 @@ defmodule Mix.Tasks.Compile.HologramTest do
 
     assert num_page_bundles == @num_pages
 
+    num_page_gzip_copies =
+      opts[:static_dir]
+      |> Path.join("page-*-????????.js.gz")
+      |> Path.wildcard()
+      |> Enum.count()
+
+    assert num_page_gzip_copies == @num_pages
+
     num_page_source_maps =
       opts[:static_dir]
       |> Path.join("page-*-????????.js.map")
@@ -655,6 +844,14 @@ defmodule Mix.Tasks.Compile.HologramTest do
 
     assert num_runtime_bundles == 1
 
+    num_runtime_gzip_copies =
+      opts[:static_dir]
+      |> Path.join("runtime-????????.js.gz")
+      |> Path.wildcard()
+      |> Enum.count()
+
+    assert num_runtime_gzip_copies == 1
+
     num_runtime_source_maps =
       opts[:static_dir]
       |> Path.join("runtime-????????.js.map")
@@ -664,7 +861,8 @@ defmodule Mix.Tasks.Compile.HologramTest do
     assert num_runtime_source_maps == 1
   end
 
-  # Helper function to wait for lock file to appear and return its content
+  # Helper function to wait for lock file to appear with content and return the content. An empty one
+  # is in the middle of being acquired.
   defp wait_for_lock_file(lock_path, timeout_ms, end_time \\ nil) do
     end_time = end_time || System.system_time(:millisecond) + timeout_ms
 
@@ -674,10 +872,10 @@ defmodule Mix.Tasks.Compile.HologramTest do
 
     if File.exists?(lock_path) do
       case File.read(lock_path) do
-        {:ok, content} ->
+        {:ok, content} when content != "" ->
           content
 
-        {:error, _reason} ->
+        _empty_or_error ->
           Process.sleep(10)
           wait_for_lock_file(lock_path, timeout_ms, end_time)
       end
@@ -728,7 +926,7 @@ defmodule Mix.Tasks.Compile.HologramTest do
     File.mkdir_p!(@manifest_dir)
     File.write!(@manifest_path, "manifest 1")
 
-    node_modules_path = link_lib_js_deps(@assets_dir, @build_dir)
+    node_modules_path = link_lib_js_deps(@assets_dir)
 
     opts = [
       assets_dir: @assets_dir,
@@ -736,6 +934,7 @@ defmodule Mix.Tasks.Compile.HologramTest do
       build_lib_dir: @build_lib_dir,
       esbuild_bin_path: Compiler.esbuild_bin_path(node_modules_path),
       js_dir: Path.join(@lib_assets_dir, "js"),
+      legacy_bundles_dir: @legacy_bundles_dir,
       node_modules_path: node_modules_path,
       static_dir: @static_dir,
       tmp_dir: @tmp_dir
@@ -750,6 +949,10 @@ defmodule Mix.Tasks.Compile.HologramTest do
 
   setup do
     File.rm(@lock_path)
+
+    # A test that dies holding the install lock would leave every later compile waiting on it.
+    File.rm(@install_lock_path)
+
     clean_dir(@tmp_dir)
 
     # Every test starts where the compile in setup_all ended: everything built, nothing in memory.
@@ -800,7 +1003,9 @@ defmodule Mix.Tasks.Compile.HologramTest do
     opts = setup_empty_assets_and_build_dirs(initial_opts)
 
     # A compile with no record of an install installs the JavaScript deps too (see test_js_deps/1).
-    package_json_digest_path = Path.join(opts[:build_dir], "package_json_digest.bin")
+    package_json_digest_path =
+      Path.join([opts[:assets_dir], "node_modules", ".package_json_digest.bin"])
+
     File.rm!(package_json_digest_path)
 
     # Test case 1: when there are no previous build artifacts
@@ -820,10 +1025,21 @@ defmodule Mix.Tasks.Compile.HologramTest do
     assert load_module_info_items(opts)[Module1] == first_run_module_info
   end
 
+  test "removes the dir in the app's static dir the bundles went to before", %{opts: opts} do
+    legacy_bundle_path = Path.join(@legacy_bundles_dir, "runtime-AAAAAAAA.js")
+
+    File.mkdir_p!(@legacy_bundles_dir)
+    File.write!(legacy_bundle_path, "")
+
+    run(opts)
+
+    refute File.exists?(@legacy_bundles_dir)
+  end
+
   describe "kept compile state" do
     setup do
       # Reset on the way out too: a test here can leave faked entries in the cache that nothing
-      # rereads, since the modules they are for are not reported as compiled.
+      # rereads, such as a library module's, which no compile checks against its beam.
       on_exit(&Cache.reset/0)
     end
 
@@ -1005,7 +1221,160 @@ defmodule Mix.Tasks.Compile.HologramTest do
       assert {:ok, %IR.ModuleDefinition{}} = PLT.get(ir_plt, Module1)
     end
 
-    test "copies the kept entry of an editable module the compiler did not report", %{
+    test "reads an editable module another process compiled", %{opts: opts} do
+      run(opts)
+
+      %{dumped_at: dumped_at, editable_modules: editable_modules, module_infos: module_infos} =
+        cache_state()
+
+      pages_reaching_module_2 = count_pages_reaching(Module2)
+
+      # Another OS process compiled it: this VM's compiler reported nothing, but the beam no longer
+      # matches the kept entry's mtime.
+      stale_info = %{module_infos[Module2] | digest: "stale", mtime: 0}
+      put_kept_module_infos(%{module_infos | Module2 => stale_info}, dumped_at, editable_modules)
+
+      assert count_built_bundles(fn -> run(opts) end) == pages_reaching_module_2
+
+      assert pages_reaching_module_2 > 0
+      assert cache_state().module_infos[Module2] == module_infos[Module2]
+    end
+
+    test "unloads the old code of a module another process compiled", %{opts: opts} do
+      run(opts)
+
+      %{dumped_at: dumped_at, editable_modules: editable_modules, module_infos: module_infos} =
+        cache_state()
+
+      load_code_other_than_beam(Module8)
+      assert :code.module_status(Module8) == :modified
+
+      stale_info = %{module_infos[Module8] | digest: "stale", mtime: 0}
+      put_kept_module_infos(%{module_infos | Module8 => stale_info}, dumped_at, editable_modules)
+
+      # Unloaded before the compile asks the pages for their routes, as the first call into the
+      # changed modules.
+      calls =
+        trace_calls([{:code, :delete, [Module8]}, {Compiler, :validate_page_modules, :_}], fn ->
+          run(opts)
+        end)
+
+      assert calls == [{:code, :delete}, {Compiler, :validate_page_modules}]
+      assert Module8.value() == :beam
+    end
+
+    test "unloads the old code of a module another process compiled after a failed compile", %{
+      opts: opts
+    } do
+      run(opts)
+
+      # What a failed compile leaves, so the next compile is cold. Then another process's compile
+      # writes its dumps, its record of the compile inputs among them, which says nothing changed.
+      Cache.clear_module_infos()
+      fake_edit_in_dump(Module8, opts)
+      load_code_other_than_beam(Module8)
+
+      run(opts)
+
+      assert Module8.value() == :beam
+    end
+
+    test "unloads the old code of a module another process compiled after a run that found nothing changed",
+         %{opts: opts} do
+      run(opts)
+
+      # A new VM whose first run finds nothing changed and compiles nothing. Then another process
+      # compiles the module, and writes a module info dump that matches its beam. Then a live
+      # reload pass compiles.
+      Cache.reset()
+      assert run(opts) == :noop
+
+      load_code_other_than_beam(Module8)
+      rewrite_module_info_dump(opts, & &1)
+
+      run(Keyword.put(opts, :force?, true))
+
+      assert Module8.value() == :beam
+    end
+
+    test "unloads the old code of a module another process compiled after a failed compile, against that process's module info dump",
+         %{opts: opts} do
+      run(opts)
+
+      # What a failed compile leaves. Then another process compiles the module, and writes a module
+      # info dump that matches its beam, so the diff against it misses the module.
+      Cache.clear_module_infos()
+      load_code_other_than_beam(Module8)
+      rewrite_module_info_dump(opts, & &1)
+
+      run(opts)
+
+      assert Module8.value() == :beam
+    end
+
+    test "unloads a module whose beam another process deleted after a failed compile, against that process's module info dump",
+         %{opts: opts} do
+      run(opts)
+
+      # What a failed compile leaves. Then another process deletes the module, and writes a module
+      # info dump without it.
+      Cache.clear_module_infos()
+      remove_beam(Module8)
+      rewrite_module_info_dump(opts, &Map.delete(&1, Module8))
+
+      run(opts)
+
+      refute :code.is_loaded(Module8)
+    end
+
+    test "checks only the diff's modules after a run that found nothing changed when the module info dump is the one it saw",
+         %{opts: opts} do
+      run(opts)
+
+      Cache.reset()
+      assert run(opts) == :noop
+
+      load_code_other_than_beam(Module8)
+      run(Keyword.put(opts, :force?, true))
+
+      assert :code.module_status(Module8) == :modified
+    end
+
+    test "unloads the old code of a module another process compiled after a failed compile, against that process's module info dump written in the same second",
+         %{opts: opts} do
+      run(opts)
+
+      Cache.clear_module_infos()
+      load_code_other_than_beam(Module8)
+      rewrite_module_info_dump(opts, & &1, 0)
+
+      run(opts)
+
+      assert Module8.value() == :beam
+    end
+
+    test "checks only the diff's modules after a failed compile when the module info dump is the one it saw",
+         %{opts: opts} do
+      run(opts)
+
+      Cache.clear_module_infos()
+      load_code_other_than_beam(Module8)
+
+      run(opts)
+
+      assert :code.module_status(Module8) == :modified
+    end
+
+    test "unloads a module whose beam another process deleted", %{opts: opts} do
+      run(opts)
+
+      remove_beam(Module8)
+      run(opts)
+
+      refute :code.is_loaded(Module8)
+    end
+
+    test "keeps loaded the old code of Hologram's own module another process compiled", %{
       opts: opts
     } do
       run(opts)
@@ -1013,23 +1382,40 @@ defmodule Mix.Tasks.Compile.HologramTest do
       %{dumped_at: dumped_at, editable_modules: editable_modules, module_infos: module_infos} =
         cache_state()
 
-      # The mtime faked here would make a check of the beam read it, so a kept digest shows that
-      # the beam was not checked, and no page is rebuilt for it.
-      kept_info = %{module_infos[Module2] | digest: "kept", mtime: 0}
-      put_kept_module_infos(%{module_infos | Module2 => kept_info}, dumped_at, editable_modules)
+      # A Hologram module the compile doesn't call.
+      module = Hologram.Benchmarks
+      load_code_other_than_beam(module)
 
-      assert count_built_bundles(fn -> run(opts) end) == 0
+      stale_info = %{module_infos[module] | digest: "stale", mtime: 0}
+      put_kept_module_infos(%{module_infos | module => stale_info}, dumped_at, editable_modules)
 
-      assert cache_state().module_infos[Module2] == kept_info
-    end
-
-    test "a run with no changes checks only the beams of the protocols", %{opts: opts} do
       run(opts)
 
-      %{editable_modules: editable_modules, module_infos: module_infos} = cache_state()
+      assert :code.module_status(module) == :modified
+    end
 
-      num_editable_protocols =
-        Enum.count(editable_modules, fn module -> module_infos[module].protocol? end)
+    test "keeps loaded a module another process compiled when its code is the beam's", %{
+      opts: opts
+    } do
+      run(opts)
+
+      %{dumped_at: dumped_at, editable_modules: editable_modules, module_infos: module_infos} =
+        cache_state()
+
+      Code.ensure_loaded!(Module8)
+
+      stale_info = %{module_infos[Module8] | digest: "stale", mtime: 0}
+      put_kept_module_infos(%{module_infos | Module8 => stale_info}, dumped_at, editable_modules)
+
+      run(opts)
+
+      assert :code.is_loaded(Module8)
+    end
+
+    test "a run with no changes checks every editable beam and builds no bundle", %{opts: opts} do
+      run(opts)
+
+      %{editable_modules: editable_modules} = cache_state()
 
       # The function a beam is checked against its entry through, which is private, so its local
       # calls are counted.
@@ -1037,14 +1423,13 @@ defmodule Mix.Tasks.Compile.HologramTest do
       :erlang.trace_pattern(mfa, true, [:local, :call_count])
 
       try do
-        run(opts)
+        assert count_built_bundles(fn -> run(opts) end) == 0
 
-        assert :erlang.trace_info(mfa, :call_count) == {:call_count, num_editable_protocols}
+        assert :erlang.trace_info(mfa, :call_count) ==
+                 {:call_count, MapSet.size(editable_modules)}
       after
         :erlang.trace_pattern(mfa, false, [:local, :call_count])
       end
-
-      assert num_editable_protocols > 0
     end
 
     test "a run into a fresh build dir dumps the call graph of what the pages reach", %{
@@ -1375,6 +1760,34 @@ defmodule Mix.Tasks.Compile.HologramTest do
       assert [{[:runtime, _first_page], true} | rest] = recorded_built.()
       refute Enum.any?(rest, fn {built, _runtime_on_disk?} -> :runtime in built end)
 
+      test_runtime_bundle(opts)
+    end
+
+    test "removes the runtime bundle a rebuild replaced as soon as its batch is built", %{
+      opts: opts
+    } do
+      run(opts)
+
+      old_bundle_info = put_kept_runtime_bundle_under_old_digest(opts)
+      fake_edit(find_editable_runtime_module())
+
+      {record_built, recorded_built} = record_calls()
+
+      old_paths = [
+        old_bundle_info.static_bundle_path,
+        Compiler.gzip_path(old_bundle_info.static_bundle_path),
+        old_bundle_info.static_source_map_path
+      ]
+
+      # Which of the old runtime's files are still on disk when a batch is reported, before the
+      # cleanup at the end of the compile.
+      bundles_built = fn built ->
+        record_built.({built, Enum.filter(old_paths, &File.exists?/1)})
+      end
+
+      run(Keyword.put(opts, :bundles_built, bundles_built))
+
+      assert [{[:runtime | _pages], []}] = recorded_built.()
       test_runtime_bundle(opts)
     end
 
@@ -2386,6 +2799,11 @@ defmodule Mix.Tasks.Compile.HologramTest do
       signature = MapSet.new([NoSuchStruct])
       bundle_path = Path.join(opts[:static_dir], "chunk-NOSUCH11.js")
       File.write!(bundle_path, "")
+
+      bundle_path
+      |> Compiler.gzip_path()
+      |> File.write!("")
+
       File.write!(bundle_path <> ".map", "")
 
       bundle_info = %{
@@ -2436,6 +2854,11 @@ defmodule Mix.Tasks.Compile.HologramTest do
       run(opts)
 
       refute File.exists?(old_bundle_info.static_bundle_path)
+
+      refute old_bundle_info.static_bundle_path
+             |> Compiler.gzip_path()
+             |> File.exists?()
+
       refute File.exists?(old_bundle_info.static_source_map_path)
       assert cache_state().chunks == chunks
       test_chunk_bundles(opts)
@@ -2993,6 +3416,15 @@ defmodule Mix.Tasks.Compile.HologramTest do
       assert count_dumps(fn -> run(opts) end) == [1, 1]
     end
 
+    test "a run with no changes writes both dumps when another VM rewrote the module info dump in the same second",
+         %{opts: opts} do
+      run(opts)
+
+      rewrite_module_info_dump(opts, & &1, 0)
+
+      assert count_dumps(fn -> run(opts) end) == [1, 1]
+    end
+
     test "a run with no changes writes the call graph dump again when it is gone", %{opts: opts} do
       run(opts)
 
@@ -3032,8 +3464,8 @@ defmodule Mix.Tasks.Compile.HologramTest do
 
       %{editable_modules: editable_modules, module_infos: module_infos} = cache_state()
 
-      # A consolidated protocol, whose beam a new implementation rewrites without a compile, so it
-      # is checked against its entry on every compile rather than taken from the compiler.
+      # A consolidated protocol, whose beam a new implementation rewrites without a compile, so the
+      # compiler reports nothing and the beam is checked against its entry.
       protocol_info = module_infos[Enumerable]
 
       # The state of a compile that dumped in the same second as the beam was last written: its
@@ -3245,6 +3677,22 @@ defmodule Mix.Tasks.Compile.HologramTest do
       assert run(opts) == :ok
     end
 
+    test "a compile after a failed one in the same VM compiles", %{opts: opts} do
+      fake_recompile()
+      assert run(opts) == :ok
+
+      # What a failed compile leaves in the cache. The record of the compile inputs this run wrote
+      # stands for one another process's compile wrote since.
+      Cache.clear_module_infos()
+
+      assert run(opts) == :ok
+    end
+
+    test "a run after one that found nothing changed in the same VM compiles", %{opts: opts} do
+      assert run(opts) == :noop
+      assert run(opts) == :ok
+    end
+
     test "a new VM with nothing changed does not compile", %{opts: opts} do
       assert count_calls({CallGraph, :load, 2}, fn ->
                assert run(opts) == :noop
@@ -3453,6 +3901,55 @@ defmodule Mix.Tasks.Compile.HologramTest do
     assert after_count == before_count
   end
 
+  describe "JS deps install" do
+    @tag timeout: 300_000
+    test "a compile into another build dir doesn't install the deps again", %{
+      opts: initial_opts
+    } do
+      opts = setup_empty_assets_and_build_dirs(initial_opts)
+      run(opts)
+
+      other_build_dir = Path.join(@test_dir, "build_other_env")
+      clean_dir(other_build_dir)
+      run(Keyword.put(opts, :build_dir, other_build_dir))
+
+      # The assets dir holds only the record the lib's deps were linked with, and a real npm install
+      # would have filled its node_modules dir.
+      refute opts[:assets_dir]
+             |> Path.join("node_modules/.bin")
+             |> File.exists?()
+    end
+
+    test "a compile waits for an install another process is running", %{opts: opts} do
+      FileUtils.write_p!(@install_lock_path, "#{start_os_process()}")
+
+      task =
+        Task.async(fn ->
+          start_time = System.system_time(:millisecond)
+          run(opts)
+          end_time = System.system_time(:millisecond)
+          end_time - start_time
+        end)
+
+      # Removed after a while, as the other process would once its install is done.
+      Process.sleep(2_000)
+      File.rm!(@install_lock_path)
+
+      assert Task.await(task, :infinity) >= 2_000
+      refute File.exists?(@install_lock_path)
+    end
+
+    test "an install lock with this VM's OS-level PID is removed", %{opts: opts} do
+      # No process of this VM holds it: its holder was killed, or an earlier VM with the same OS-level
+      # PID left it.
+      FileUtils.write_p!(@install_lock_path, System.pid())
+
+      run(opts)
+
+      refute File.exists?(@install_lock_path)
+    end
+  end
+
   describe "compiler locking" do
     test "locking mechanism prevents concurrent compilation", %{opts: opts} do
       # The lock guards the actual compilation work, which emits
@@ -3502,7 +3999,13 @@ defmodule Mix.Tasks.Compile.HologramTest do
         run(opts)
       end
 
-      refute File.exists?(@lock_path)
+      refute opts[:build_dir]
+             |> Path.join(@compiler_lock_file_name)
+             |> File.exists?()
+
+      refute opts[:assets_dir]
+             |> Path.join(Reflection.js_deps_install_lock_file_name())
+             |> File.exists?()
     end
 
     test "lock dir (which is the build dir) is created if it doesn't exist", %{opts: initial_opts} do
@@ -3541,9 +4044,7 @@ defmodule Mix.Tasks.Compile.HologramTest do
     end
 
     test "valid lock file with running OS-level process is respected", %{opts: opts} do
-      # Create a lock file with the current process PID (which is definitely running)
-      current_os_pid = System.pid()
-      FileUtils.write_p!(@lock_path, "#{current_os_pid}")
+      FileUtils.write_p!(@lock_path, "#{start_os_process()}")
 
       assert File.exists?(@lock_path)
 
@@ -3567,6 +4068,41 @@ defmodule Mix.Tasks.Compile.HologramTest do
       assert duration >= 2_000
 
       # Lock should be cleaned up after successful compilation
+      refute File.exists?(@lock_path)
+    end
+
+    test "lock file with this VM's OS-level PID is removed", %{opts: opts} do
+      # No process of this VM holds it: its holder was killed, or an earlier VM with the same OS-level
+      # PID left it.
+      FileUtils.write_p!(@lock_path, System.pid())
+
+      run(opts)
+
+      refute File.exists?(@lock_path)
+    end
+
+    @tag :capture_log
+    test "lock file left by a compilation killed in this VM is removed", %{opts: opts} do
+      # A kill skips the compilation's own removal of the lock file.
+      {pid, ref} = spawn_monitor(fn -> run(opts) end)
+      wait_for_lock_file(@lock_path, 5_000)
+
+      # The processes the compilation is linked to exit along with it, and are waited for, so that
+      # none is still running when the next compilation starts.
+      {:links, links} = Process.info(pid, :links)
+      linked_refs = for linked when is_pid(linked) <- links, do: Process.monitor(linked)
+
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+
+      for linked_ref <- linked_refs do
+        assert_receive {:DOWN, ^linked_ref, :process, _linked, _reason}, 5_000
+      end
+
+      assert File.read!(@lock_path) == System.pid()
+
+      run(opts)
+
       refute File.exists?(@lock_path)
     end
 

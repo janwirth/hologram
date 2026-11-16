@@ -2,6 +2,7 @@ defmodule Hologram.CompilerTest do
   use Hologram.Test.BasicCase, async: false
   import Hologram.Compiler
 
+  alias Hologram.Commons.CryptographicUtils
   alias Hologram.Commons.FileUtils
   alias Hologram.Commons.PLT
   alias Hologram.Commons.SystemUtils
@@ -252,17 +253,15 @@ defmodule Hologram.CompilerTest do
   defp setup_js_deps_test(test_subdir) do
     test_tmp_dir = Path.join([@tmp_dir, "tests", "compiler", test_subdir])
     assets_dir = Path.join(test_tmp_dir, "assets")
-    build_dir = Path.join(test_tmp_dir, "build")
 
     clean_dir(test_tmp_dir)
     File.mkdir_p!(assets_dir)
-    File.mkdir_p!(build_dir)
 
     lib_package_json_path = Path.join(@assets_dir, "package.json")
     fixture_package_json_path = Path.join(assets_dir, "package.json")
     File.cp!(lib_package_json_path, fixture_package_json_path)
 
-    [assets_dir: assets_dir, build_dir: build_dir]
+    [assets_dir: assets_dir]
   end
 
   # A module info PLT holding Module1, Module2, Module3 and Hologram.JS, the module of the manually
@@ -2186,6 +2185,11 @@ defmodule Hologram.CompilerTest do
 
       assert File.read!(static_bundle_path) == expected_bundle_js
 
+      assert static_bundle_path
+             |> gzip_path()
+             |> File.read!()
+             |> :zlib.gunzip() == expected_bundle_js
+
       expected_source_map_js =
         normalize_newlines("""
         {
@@ -2594,6 +2598,11 @@ defmodule Hologram.CompilerTest do
 
       assert File.read!(static_bundle_path_1) == expected_bundle_js_1
 
+      assert static_bundle_path_1
+             |> gzip_path()
+             |> File.read!()
+             |> :zlib.gunzip() == expected_bundle_js_1
+
       expected_bundle_js_2 =
         normalize_newlines("""
         (()=>{var o=2;})();
@@ -2601,6 +2610,11 @@ defmodule Hologram.CompilerTest do
         """)
 
       assert File.read!(static_bundle_path_2) == expected_bundle_js_2
+
+      assert static_bundle_path_2
+             |> gzip_path()
+             |> File.read!()
+             |> :zlib.gunzip() == expected_bundle_js_2
 
       expected_source_map_js_2 =
         normalize_newlines("""
@@ -3196,6 +3210,41 @@ defmodule Hologram.CompilerTest do
     assert Enum.sort(result.added_modules) == [:module_2, :module_4]
     assert Enum.sort(result.removed_modules) == [:module_5, :module_7]
     assert Enum.sort(result.edited_modules) == [:module_3, :module_6]
+  end
+
+  describe "dump_module_info_plt/2" do
+    setup do
+      test_tmp_dir = Path.join([@tmp_dir, "tests", "compiler", "dump_module_info_plt_2"])
+      clean_dir(test_tmp_dir)
+
+      [dump_path: Path.join([test_tmp_dir, "build", Reflection.module_info_plt_dump_file_name()])]
+    end
+
+    test "writes the PLT and a token", %{dump_path: dump_path} do
+      plt = PLT.put(PLT.start(), :module_1, %{digest: 1})
+
+      assert dump_module_info_plt(plt, dump_path) == :ok
+
+      loaded_plt = PLT.start()
+      PLT.maybe_load(loaded_plt, dump_path)
+
+      assert PLT.get_all(loaded_plt) == %{module_1: %{digest: 1}}
+      assert {_mtime, token} = module_info_dump_stamp(dump_path)
+      assert is_binary(token)
+    end
+
+    test "gives a dump written again within the same second another stamp", %{
+      dump_path: dump_path
+    } do
+      plt = PLT.start()
+      dump_module_info_plt(plt, dump_path)
+      {mtime, _token} = old_stamp = module_info_dump_stamp(dump_path)
+
+      dump_module_info_plt(plt, dump_path)
+      File.touch!(dump_path, mtime)
+
+      assert module_info_dump_stamp(dump_path) != old_stamp
+    end
   end
 
   describe "encode_reachable_functions/5" do
@@ -3872,6 +3921,11 @@ defmodule Hologram.CompilerTest do
     end
   end
 
+  test "gzip_path/1" do
+    assert gzip_path("/my_static_dir/runtime-AAAAAAAA.js") ==
+             "/my_static_dir/runtime-AAAAAAAA.js.gz"
+  end
+
   describe "install_js_deps/1" do
     setup do
       setup_js_deps_test("install_js_deps_1")
@@ -3879,10 +3933,9 @@ defmodule Hologram.CompilerTest do
 
     @tag timeout: 300_000
     test "installs deps in node_modules dir and creates package-lock.json file", %{
-      assets_dir: assets_dir,
-      build_dir: build_dir
+      assets_dir: assets_dir
     } do
-      install_js_deps(assets_dir, build_dir)
+      install_js_deps(assets_dir)
 
       node_modules_dir = Path.join(assets_dir, "node_modules")
       assert File.exists?(node_modules_dir)
@@ -3892,25 +3945,48 @@ defmodule Hologram.CompilerTest do
     end
 
     @tag timeout: 300_000
-    test "creates a file containing the digest of package.json", %{
-      assets_dir: assets_dir,
-      build_dir: build_dir
+    test "creates a file containing the digest of package.json in the node_modules dir", %{
+      assets_dir: assets_dir
     } do
-      install_js_deps(assets_dir, build_dir)
+      install_js_deps(assets_dir)
 
-      package_json_digest_path = Path.join(build_dir, "package_json_digest.bin")
-      assert File.exists?(package_json_digest_path)
+      expected_digest =
+        assets_dir
+        |> Path.join("package.json")
+        |> File.read!()
+        |> CryptographicUtils.digest(:sha256, :binary)
+
+      package_json_digest_path =
+        Path.join([assets_dir, "node_modules", ".package_json_digest.bin"])
+
+      assert File.read!(package_json_digest_path) == expected_digest
     end
 
-    test "raises RuntimeError if npm install command fails", %{
-      assets_dir: assets_dir,
-      build_dir: build_dir
+    test "removes the record of the last install when npm install command fails", %{
+      assets_dir: assets_dir
     } do
+      link_lib_js_deps(assets_dir)
+
+      package_json_digest_path =
+        Path.join([assets_dir, "node_modules", ".package_json_digest.bin"])
+
+      assets_dir
+      |> Path.join("package.json")
+      |> File.rm!()
+
+      assert_raise RuntimeError, "npm install command failed", fn ->
+        install_js_deps(assets_dir)
+      end
+
+      refute File.exists?(package_json_digest_path)
+    end
+
+    test "raises RuntimeError if npm install command fails", %{assets_dir: assets_dir} do
       fixture_package_json_path = Path.join(assets_dir, "package.json")
       File.rm!(fixture_package_json_path)
 
       assert_raise RuntimeError, "npm install command failed", fn ->
-        install_js_deps(assets_dir, build_dir)
+        install_js_deps(assets_dir)
       end
 
       node_modules_dir = Path.join(assets_dir, "node_modules")
@@ -3919,7 +3995,9 @@ defmodule Hologram.CompilerTest do
       package_lock_json_path = Path.join(assets_dir, "package-lock.json")
       assert File.exists?(package_lock_json_path)
 
-      package_json_digest_path = Path.join(build_dir, "package_json_digest.bin")
+      package_json_digest_path =
+        Path.join([assets_dir, "node_modules", ".package_json_digest.bin"])
+
       refute File.exists?(package_json_digest_path)
     end
   end
@@ -4507,53 +4585,71 @@ defmodule Hologram.CompilerTest do
 
   describe "maybe_install_js_deps/1" do
     setup do
-      [assets_dir: assets_dir, build_dir: build_dir] =
-        setup_js_deps_test("maybe_install_js_deps_1")
+      [assets_dir: assets_dir] = setup_js_deps_test("maybe_install_js_deps_1")
 
       # The record an install leaves, without one: the deps are the lib's.
-      link_lib_js_deps(assets_dir, build_dir)
+      link_lib_js_deps(assets_dir)
 
-      [assets_dir: assets_dir, build_dir: build_dir]
+      package_json_digest_path =
+        Path.join([assets_dir, "node_modules", ".package_json_digest.bin"])
+
+      [assets_dir: assets_dir, package_json_digest_path: package_json_digest_path]
     end
 
     @tag timeout: 300_000
-    test "package_json_digest.bin file doesn't exist", %{
+    test "the record of the last install doesn't exist", %{
       assets_dir: assets_dir,
-      build_dir: build_dir
+      package_json_digest_path: package_json_digest_path
     } do
-      package_json_digest_path = Path.join(build_dir, "package_json_digest.bin")
       File.rm!(package_json_digest_path)
 
-      assert maybe_install_js_deps(assets_dir, build_dir) == :ok
+      assert maybe_install_js_deps(assets_dir) == :ok
       assert File.exists?(package_json_digest_path)
     end
 
     @tag timeout: 300_000
-    test "package-lock.json file doesn't exist", %{assets_dir: assets_dir, build_dir: build_dir} do
+    test "node_modules dir doesn't exist", %{
+      assets_dir: assets_dir,
+      package_json_digest_path: package_json_digest_path
+    } do
+      assets_dir
+      |> Path.join("node_modules")
+      |> File.rm_rf!()
+
+      assert maybe_install_js_deps(assets_dir) == :ok
+      assert File.exists?(package_json_digest_path)
+    end
+
+    @tag timeout: 300_000
+    test "package-lock.json file doesn't exist", %{assets_dir: assets_dir} do
       package_lock_json_path = Path.join(assets_dir, "package-lock.json")
       File.rm!(package_lock_json_path)
 
-      assert maybe_install_js_deps(assets_dir, build_dir) == :ok
+      assert maybe_install_js_deps(assets_dir) == :ok
       assert File.exists?(package_lock_json_path)
     end
 
     @tag timeout: 300_000
-    test "package.json file changed", %{assets_dir: assets_dir, build_dir: build_dir} do
-      package_json_digest_path = Path.join(build_dir, "package_json_digest.bin")
+    test "package.json file changed", %{
+      assets_dir: assets_dir,
+      package_json_digest_path: package_json_digest_path
+    } do
       package_json_digest = File.read!(package_json_digest_path)
 
       package_json_path = Path.join(assets_dir, "package.json")
       File.write!(package_json_path, "{}")
 
-      assert maybe_install_js_deps(assets_dir, build_dir) == :ok
+      assert maybe_install_js_deps(assets_dir) == :ok
       assert File.read!(package_json_digest_path) != package_json_digest
     end
 
-    test "install is not needed", %{assets_dir: assets_dir, build_dir: build_dir} do
-      package_json_digest_path = Path.join(build_dir, "package_json_digest.bin")
+    test "install is not needed", %{
+      assets_dir: assets_dir,
+      package_json_digest_path: package_json_digest_path
+    } do
       package_json_digest_mtime = File.stat!(package_json_digest_path).mtime
 
-      assert maybe_install_js_deps(assets_dir, build_dir) == nil
+      assert maybe_install_js_deps(assets_dir) == nil
       assert File.stat!(package_json_digest_path).mtime == package_json_digest_mtime
     end
   end
@@ -4607,6 +4703,35 @@ defmodule Hologram.CompilerTest do
     end
   end
 
+  describe "module_info_dump_stamp/1" do
+    setup do
+      test_tmp_dir = Path.join([@tmp_dir, "tests", "compiler", "module_info_dump_stamp_1"])
+      clean_dir(test_tmp_dir)
+
+      [dump_path: Path.join(test_tmp_dir, Reflection.module_info_plt_dump_file_name())]
+    end
+
+    test "dump with a token", %{dump_path: dump_path} do
+      File.write!(dump_path, "dump")
+      File.write!(dump_path <> ".token", "token")
+
+      assert module_info_dump_stamp(dump_path) ==
+               {File.stat!(dump_path, time: :posix).mtime, "token"}
+    end
+
+    test "dump with no token", %{dump_path: dump_path} do
+      File.write!(dump_path, "dump")
+
+      assert module_info_dump_stamp(dump_path) == {File.stat!(dump_path, time: :posix).mtime, nil}
+    end
+
+    test "no dump", %{dump_path: dump_path} do
+      File.write!(dump_path <> ".token", "token")
+
+      assert module_info_dump_stamp(dump_path) == nil
+    end
+  end
+
   describe "partition_affected_pages/6" do
     setup do
       test_tmp_dir = Path.join([@tmp_dir, "tests", "compiler", "partition_affected_pages_6"])
@@ -4614,6 +4739,7 @@ defmodule Hologram.CompilerTest do
 
       bundle_path = Path.join(test_tmp_dir, "page-kept.js")
       File.write!(bundle_path, "bundle")
+      File.write!(bundle_path <> ".gz", "gzip copy")
       File.write!(bundle_path <> ".map", "map")
 
       page_state = fn modules, path ->
@@ -4859,6 +4985,7 @@ defmodule Hologram.CompilerTest do
       clean_dir(test_tmp_dir)
       bundle_path = Path.join(test_tmp_dir, "page-kept.js")
       File.write!(bundle_path, "bundle")
+      File.write!(bundle_path <> ".gz", "gzip copy")
       File.write!(bundle_path <> ".map", "map")
       static_dir = test_tmp_dir
 
@@ -5117,17 +5244,42 @@ defmodule Hologram.CompilerTest do
       [empty_diff: %{added_modules: [], edited_modules: [], removed_modules: []}]
     end
 
-    test "leaves the entry of a module the compiler did not report", %{empty_diff: empty_diff} do
+    test "reads a module the compiler did not report when its beam moved since its entry", %{
+      empty_diff: empty_diff
+    } do
+      # Another OS process compiled it: this VM's compiler reported nothing, but the beam's mtime
+      # moved.
       beam_path = :code.which(Hologram.Reflection)
-
-      # Its mtime moved, so a check of the beam would read it.
-      old_info = %{Reflection.beam_info(beam_path) | digest: 1, mtime: 0}
-      plt = PLT.put(PLT.start(), Hologram.Reflection, old_info)
+      beam_info = Reflection.beam_info(beam_path)
+      plt = PLT.put(PLT.start(), Hologram.Reflection, %{beam_info | digest: 1, mtime: 0})
 
       result =
         patch_module_info_plt!(
           plt,
-          nil,
+          beam_info.mtime + 2,
+          MapSet.new([Hologram.Reflection]),
+          [{Hologram.Reflection, beam_path}],
+          MapSet.new()
+        )
+
+      assert result == {%{empty_diff | edited_modules: [Hologram.Reflection]}, true}
+      assert PLT.get!(plt, Hologram.Reflection) == beam_info
+    end
+
+    test "keeps the entry of a module the compiler did not report when its beam matches it", %{
+      empty_diff: empty_diff
+    } do
+      beam_path = :code.which(Hologram.Reflection)
+
+      # The faked digest would show as an edit if the beam were read.
+      old_info = %{Reflection.beam_info(beam_path) | digest: 1}
+      plt = PLT.put(PLT.start(), Hologram.Reflection, old_info)
+
+      # Untouched and a second older than the dump, so the entry is reused.
+      result =
+        patch_module_info_plt!(
+          plt,
+          old_info.mtime + 1,
           MapSet.new([Hologram.Reflection]),
           [{Hologram.Reflection, beam_path}],
           MapSet.new()
@@ -5260,60 +5412,26 @@ defmodule Hologram.CompilerTest do
       assert PLT.get(plt, module) == :error
     end
 
-    test "checks the beam of a protocol the compiler did not report", %{empty_diff: empty_diff} do
-      beam_path = :code.which(Enumerable)
-
-      plt =
-        PLT.put(PLT.start(), Enumerable, %{Reflection.beam_info(beam_path) | digest: 1, mtime: 0})
-
-      result =
-        patch_module_info_plt!(
-          plt,
-          nil,
-          MapSet.new([Enumerable]),
-          [{Enumerable, beam_path}],
-          MapSet.new()
-        )
-
-      assert result == {%{empty_diff | edited_modules: [Enumerable]}, true}
-      assert PLT.get!(plt, Enumerable) == Reflection.beam_info(beam_path)
-    end
-
-    test "reuses the entry of a protocol whose beam is untouched and older than the dump", %{
-      empty_diff: empty_diff
-    } do
-      beam_path = :code.which(Enumerable)
-      %File.Stat{mtime: mtime} = File.stat!(beam_path, time: :posix)
-      old_info = %{Reflection.beam_info(beam_path) | digest: 1}
-      plt = PLT.put(PLT.start(), Enumerable, old_info)
-
-      result =
-        patch_module_info_plt!(
-          plt,
-          mtime + 1,
-          MapSet.new([Enumerable]),
-          [{Enumerable, beam_path}],
-          MapSet.new()
-        )
-
-      assert result == {empty_diff, false}
-      assert PLT.get!(plt, Enumerable) == old_info
-    end
-
     test "leaves every entry as the beams and the reported modules say, and finds the diff" do
       reflection_path = :code.which(Hologram.Reflection)
       compiler_path = :code.which(Hologram.Compiler)
       enumerable_path = :code.which(Enumerable)
 
       plt_path = :code.which(Hologram.Commons.PLT)
-      kept_reflection_info = %{Reflection.beam_info(reflection_path) | digest: 1, mtime: 0}
+      tracer_path = :code.which(Hologram.Compiler.Tracer)
+
+      # The faked digest would show as an edit if the beam were read.
+      kept_reflection_info = %{Reflection.beam_info(reflection_path) | digest: 1}
 
       plt =
         PLT.put(PLT.start(), [
           # Not editable.
           {Enum, %{digest: "kept"}},
-          # Editable, not reported, mtime moved: left as it is.
+          # Editable, not reported, beam as its entry says: left as it is.
           {Hologram.Reflection, kept_reflection_info},
+          # Editable, not reported, mtime moved, as when another OS process compiled it: read
+          # again.
+          {Hologram.Compiler.Tracer, %{Reflection.beam_info(tracer_path) | digest: 1, mtime: 0}},
           # Reported: read again.
           {Hologram.Compiler, %{Reflection.beam_info(compiler_path) | digest: 1}},
           # A protocol not reported, mtime moved: read again.
@@ -5323,10 +5441,17 @@ defmodule Hologram.CompilerTest do
         ])
 
       editable_modules =
-        MapSet.new([Hologram.Reflection, Hologram.Compiler, Enumerable, :removed_module])
+        MapSet.new([
+          Hologram.Reflection,
+          Hologram.Compiler.Tracer,
+          Hologram.Compiler,
+          Enumerable,
+          :removed_module
+        ])
 
       editable_beams = [
         {Hologram.Reflection, reflection_path},
+        {Hologram.Compiler.Tracer, tracer_path},
         {Hologram.Compiler, compiler_path},
         {Enumerable, enumerable_path},
         # No entry: added.
@@ -5335,12 +5460,20 @@ defmodule Hologram.CompilerTest do
 
       compiled_modules = MapSet.new([Hologram.Compiler])
 
+      # Past every beam's mtime, so that a beam its entry matches is not read.
+      dumped_at =
+        editable_beams
+        |> Enum.map(fn {_module, beam_path} -> Reflection.beam_info(beam_path).mtime end)
+        |> Enum.max()
+        |> Kernel.+(2)
+
       {diff, changed?} =
-        patch_module_info_plt!(plt, nil, editable_modules, editable_beams, compiled_modules)
+        patch_module_info_plt!(plt, dumped_at, editable_modules, editable_beams, compiled_modules)
 
       assert PLT.get_all(plt) == %{
                Enum => %{digest: "kept"},
                Hologram.Reflection => kept_reflection_info,
+               Hologram.Compiler.Tracer => Reflection.beam_info(tracer_path),
                Hologram.Compiler => Reflection.beam_info(compiler_path),
                Enumerable => Reflection.beam_info(enumerable_path),
                Hologram.Commons.PLT => Reflection.beam_info(plt_path)
@@ -5348,7 +5481,7 @@ defmodule Hologram.CompilerTest do
 
       assert diff == %{
                added_modules: [Hologram.Commons.PLT],
-               edited_modules: [Enumerable, Hologram.Compiler],
+               edited_modules: [Enumerable, Hologram.Compiler, Hologram.Compiler.Tracer],
                removed_modules: [:removed_module]
              }
 
@@ -5880,6 +6013,7 @@ defmodule Hologram.CompilerTest do
 
       bundle_path = Path.join(static_dir, "page-kept.js")
       File.write!(bundle_path, "bundle")
+      File.write!(bundle_path <> ".gz", "gzip copy")
       File.write!(bundle_path <> ".map", "map")
 
       bundle_info = %{
@@ -5890,7 +6024,7 @@ defmodule Hologram.CompilerTest do
       [bundle_info: bundle_info, static_dir: static_dir]
     end
 
-    test "a bundle and its source map on disk in the given static dir", %{
+    test "a bundle, its gzip copy and its source map on disk in the given static dir", %{
       bundle_info: bundle_info,
       static_dir: static_dir
     } do
@@ -5899,6 +6033,12 @@ defmodule Hologram.CompilerTest do
 
     test "a bundle whose file is gone", %{bundle_info: bundle_info, static_dir: static_dir} do
       File.rm!(bundle_info.static_bundle_path)
+
+      refute usable_bundle?(bundle_info, static_dir)
+    end
+
+    test "a bundle whose gzip copy is gone", %{bundle_info: bundle_info, static_dir: static_dir} do
+      File.rm!(bundle_info.static_bundle_path <> ".gz")
 
       refute usable_bundle?(bundle_info, static_dir)
     end

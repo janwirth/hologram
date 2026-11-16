@@ -32,32 +32,15 @@ defmodule Hologram.Commons.FileUtils do
         [path]
 
       File.dir?(path) ->
-        list_dir_files_recursively(path)
+        path
+        |> File.ls!()
+        |> Enum.map(&Path.join(path, &1))
+        |> Enum.map(&list_files_recursively/1)
+        |> Enum.concat()
+        |> Enum.sort()
 
       true ->
         raise ArgumentError, ~s(Invalid path: "#{path}")
-    end
-  end
-
-  # An entry that is neither a file nor a dir by the time it is looked at is skipped: another tool
-  # writing to the same tree (esbuild replacing its chunk files while the asset registry reloads,
-  # say) removes files between the listing and the check, and a dangling symlink is nothing to list.
-  defp list_dir_files_recursively(dir) do
-    case File.ls(dir) do
-      {:ok, names} ->
-        names
-        |> Enum.map(&Path.join(dir, &1))
-        |> Enum.flat_map(fn path ->
-          cond do
-            File.regular?(path) -> [path]
-            File.dir?(path) -> list_dir_files_recursively(path)
-            true -> []
-          end
-        end)
-        |> Enum.sort()
-
-      {:error, _reason} ->
-        []
     end
   end
 

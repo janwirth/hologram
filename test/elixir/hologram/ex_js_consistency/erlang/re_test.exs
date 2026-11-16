@@ -444,6 +444,35 @@ defmodule Hologram.ExJsConsistency.Erlang.ReTest do
       assert_re_pattern(:re.import(exported), 0, 0, 1)
     end
 
+    test "returns a new pattern ref on each call" do
+      {:ok, exported} = :re.compile("(a)é", [:export, :unicode, {:newline, :crlf}])
+
+      re_pattern_1 = :re.import(exported)
+      re_pattern_2 = :re.import(exported)
+
+      assert_re_pattern(re_pattern_1, 1, 1, 1)
+      assert_re_pattern(re_pattern_2, 1, 1, 1)
+
+      refute elem(re_pattern_1, 4) == elem(re_pattern_2, 4)
+    end
+
+    test "matches through the second import of the same pattern" do
+      {:ok, exported} = :re.compile("ab", [:export])
+
+      :re.import(exported)
+      re_pattern = :re.import(exported)
+
+      assert :re.run("xab", re_pattern) == {:match, [{1, 2}]}
+    end
+
+    test "applies each import's own options for the same source" do
+      {:ok, caseless} = :re.compile("ab", [:export, :caseless])
+      {:ok, case_sensitive} = :re.compile("ab", [:export])
+
+      assert :re.run("AB", :re.import(caseless)) == {:match, [{0, 2}]}
+      assert :re.run("AB", :re.import(case_sensitive)) == :nomatch
+    end
+
     test "raises ArgumentError on non-tuple term" do
       assert_error ArgumentError,
                    build_argument_error_msg(1, "not an exported regular expression"),
@@ -1123,6 +1152,37 @@ defmodule Hologram.ExJsConsistency.Erlang.ReTest do
       assert :re.run("a\nb", "b", [:firstline, {:offset, 2}]) == {:match, [{2, 1}]}
     end
 
+    test "global firstline looks up the first newline once per run" do
+      subject = String.duplicate("a", 300)
+      expected = for k <- 0..299, do: [{k, 1}]
+
+      assert :re.run(subject, "a", [:global, :firstline]) == {:match, expected}
+    end
+
+    test "global firstline looks up the newline again past a crossing match" do
+      assert :re.run("a\nab\nb", "a\na|b", [:global, :firstline]) ==
+               {:match, [[{0, 3}], [{3, 1}]]}
+    end
+
+    test "global firstline looks up the newline again for a retry past it" do
+      assert :re.run("a\nb\nb", "a\\n\\K|b", [:global, :firstline]) ==
+               {:match, [[{2, 0}], [{2, 1}]]}
+    end
+
+    test "global \\X segments the subject once per run" do
+      subject = String.duplicate("é", 300)
+      expected = for k <- 0..299, do: [{2 * k, 2}]
+
+      assert :re.run(subject, "\\X", [:global, :unicode]) == {:match, expected}
+    end
+
+    test "global \\X segments the subject once per run with empty matches" do
+      subject = String.duplicate("é", 50)
+      expected = for k <- 0..49, do: [{2 * k, 0}]
+
+      assert :re.run(subject, "(?=\\X)", [:global, :unicode]) == {:match, expected}
+    end
+
     test "compile-time firstline pattern applies when running" do
       {:ok, compiled} = :re.compile("b", [:firstline])
 
@@ -1164,6 +1224,18 @@ defmodule Hologram.ExJsConsistency.Erlang.ReTest do
 
     test "global advances over a whole character in unicode mode" do
       assert :re.run("😀", "x*", [:global, :unicode]) == {:match, [[{0, 0}], [{4, 0}]]}
+    end
+
+    test "global reports byte offsets of captures before the match start in unicode mode" do
+      assert :re.run("aé😀b", "(?<=(é😀))b|é", [:global, :unicode]) ==
+               {:match, [[{1, 2}], [{7, 1}, {1, 6}]]}
+    end
+
+    test "global converts byte offsets in one pass over a unicode subject" do
+      subject = String.duplicate("é ", 100)
+      expected = for k <- 0..99, do: [{3 * k, 2}]
+
+      assert :re.run(subject, "é", [:global, :unicode]) == {:match, expected}
     end
 
     test "global starts at the offset" do
