@@ -20,7 +20,7 @@ globalThis.Hologram._recordEarlyEvent = function(event) {
 });
 """
 
-# assets/js/hologram.mjs: Hologram.replayEarlyEvents(), called after the render's log line
+# assets/js/hologram.mjs: Hologram.replayEarlyEvents(), called right after the "page rendered" log
 REPLAY = """globalThis.__replayEarlyEvents = function() {
   const events = globalThis.Hologram?._earlyEvents;
   const recorder = globalThis.Hologram?._recordEarlyEvent;
@@ -49,10 +49,11 @@ class Handler(BaseHTTPRequestHandler):
                 1,
             ).encode()
         elif re.search(r"/hologram/runtime-[A-Z0-9]+\.js$", self.path):
-            body = (REPLAY + body.decode()).replace(
-                'console.log("Hologram: page rendered in",',
-                'globalThis.__replayEarlyEvents(),console.log("Hologram: page rendered in",',
-                1,
+            body = re.sub(
+                r'(console\.log\("Hologram: page rendered in",[\w$]+\.diff\(\w+\)\))',
+                r'\1,globalThis.__replayEarlyEvents()',
+                REPLAY + body.decode(),
+                count=1,
             ).encode()
         self.send_response(200)
         self.send_header("content-type", kind)
