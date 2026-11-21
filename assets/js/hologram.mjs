@@ -266,6 +266,20 @@ export default class Hologram {
     }
   }
 
+  // The profiling lines (each action, each render, each function an action calls) flood the
+  // console, so they are logged only when the page opts in: globalThis.Hologram.profile = true,
+  // or localStorage "hologram:profile" set to "1".
+  static isProfilingOptedIn() {
+    if (globalThis.Hologram.profile === true) return true;
+
+    try {
+      return globalThis.localStorage?.getItem("hologram:profile") === "1";
+    } catch {
+      // A sandboxed frame throws on reading localStorage.
+      return false;
+    }
+  }
+
   // This function is intentionally NOT async. Actions that use Task.await/1 return
   // a Promise, but we handle it with .then() instead of async/await. Making this
   // function async would wrap ALL errors (including from sync actions) in rejected
@@ -280,7 +294,7 @@ export default class Hologram {
   // Deps: [:maps.get/2]
   static executeAction(action, epoch = $.registryEpoch) {
     const startTime = performance.now();
-    globalThis.Hologram.isProfilingEnabled = true;
+    globalThis.Hologram.isProfilingEnabled = Hologram.isProfilingOptedIn();
 
     const name = Erlang_Maps["get/2"](Type.atom("name"), action);
     const params = Erlang_Maps["get/2"](Type.atom("params"), action);
@@ -870,7 +884,9 @@ export default class Hologram {
       $.isRendering = false;
     }
 
-    console.log("Hologram: page rendered in", PerformanceTimer.diff(startTime));
+    if (Hologram.isProfilingOptedIn()) {
+      console.log("Hologram: page rendered in", PerformanceTimer.diff(startTime));
+    }
 
     // The page's listeners are live from here, so what the user did before is handed to them.
     Hologram.replayEarlyEvents();
@@ -2492,12 +2508,14 @@ export default class Hologram {
 
     globalThis.Hologram.isProfilingEnabled = false;
 
-    console.log(
-      "Hologram: action",
-      `:${name.value}`,
-      "executed in",
-      PerformanceTimer.diff(startTime),
-    );
+    if (Hologram.isProfilingOptedIn()) {
+      console.log(
+        "Hologram: action",
+        `:${name.value}`,
+        "executed in",
+        PerformanceTimer.diff(startTime),
+      );
+    }
 
     Hologram.render();
 

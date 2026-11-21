@@ -1036,6 +1036,27 @@ describe("Hologram", () => {
     });
   });
 
+  describe("isProfilingOptedIn()", () => {
+    afterEach(() => {
+      delete globalThis.Hologram.profile;
+      localStorage.removeItem("hologram:profile");
+    });
+
+    it("is off by default", () => {
+      assert.isFalse(Hologram.isProfilingOptedIn());
+    });
+
+    it("is on when the page sets globalThis.Hologram.profile", () => {
+      globalThis.Hologram.profile = true;
+      assert.isTrue(Hologram.isProfilingOptedIn());
+    });
+
+    it("is on when localStorage holds hologram:profile = 1", () => {
+      localStorage.setItem("hologram:profile", "1");
+      assert.isTrue(Hologram.isProfilingOptedIn());
+    });
+  });
+
   describe("executeLoadPrefetchedPageAction()", () => {
     let clientFetchPageStub,
       eventTargetNode,
