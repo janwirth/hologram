@@ -648,7 +648,14 @@ defmodule Hologram.Realtime.SSE do
   # adapter's connection process, which serves the next keep-alive request once
   # the stream ends, so stream/2 restores it (a cap left behind killed an
   # ordinary page render of a large page).
+  #
+  # The cap counts allocated heap blocks, live data or not, and is checked at the
+  # next GC before it frees anything. An earlier request on the same connection
+  # (a big page render) can leave blocks above the cap with almost no live data,
+  # so collect first: otherwise the first GC in the pump kills an idle stream.
   defp configure_backpressure_safety_net do
+    :erlang.garbage_collect()
+
     Process.flag(:max_heap_size, %{
       size: @max_heap_size_words,
       kill: true,

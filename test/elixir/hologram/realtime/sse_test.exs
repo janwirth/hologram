@@ -102,6 +102,15 @@ defmodule Hologram.Realtime.SSETest do
     token
   end
 
+  # Collects while a list of `cells` cells is live, so the heap block is sized
+  # for it, then drops the list: the block stays allocated until the next GC.
+  defp leave_heap_garbage(cells) do
+    list = Enum.to_list(1..cells)
+    :erlang.garbage_collect()
+    _ = length(list)
+    :ok
+  end
+
   defp live_reload_subscriber?(pid) do
     Hologram.PubSub
     |> Registry.lookup("hologram_live_reload")
@@ -1775,6 +1784,33 @@ defmodule Hologram.Realtime.SSETest do
       assert_receive {:after_stream, {:max_heap_size, %{size: 0}}}
     end
 
+    # An earlier keep-alive request (a big page render) can leave heap blocks
+    # above the cap with almost no live data; the first GC under the cap killed
+    # the stream (ezpz prod: total heap 1_636_057 words, live ~90_000).
+    test "survives a GC when an earlier request left a heap above the cap" do
+      conn = conn_with_instance_id()
+      test_pid = self()
+
+      pid =
+        spawn(fn ->
+          leave_heap_garbage(700_000)
+          send(test_pid, {:before_stream, Process.info(self(), :total_heap_size)})
+          stream(conn)
+        end)
+
+      assert_receive {:before_stream, {:total_heap_size, size}}
+      assert size > 1_000_000
+
+      Process.sleep(50)
+      ref = Process.monitor(pid)
+      :erlang.garbage_collect(pid)
+
+      refute_receive {:DOWN, ^ref, :process, ^pid, _reason}, 100
+      assert Process.alive?(pid)
+
+      Process.exit(pid, :kill)
+    end
+
     test "listens for live reload in the dev and test envs" do
       for env <- ["dev", "test"] do
         put_hologram_env(env)
@@ -1915,4 +1951,5 @@ defmodule Hologram.Realtime.SSETest do
       refute_receive :hi_user
     end
   end
+
 end
